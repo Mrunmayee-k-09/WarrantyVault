@@ -1,7 +1,6 @@
 """Daily warranty reminder generation and optional email delivery."""
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
-
 from ..extensions import db
 from ..models import Notification, Product, User
 from .mailer import send_email
@@ -72,7 +71,7 @@ def process_due_reminders(app, today: date | None = None) -> dict:
                         subject=f"Warranty expiry reminder: {product.name}",
                         body=body,
                     )
-                    notification.email_sent_at = datetime.utcnow()
+                    notification.email_sent_at = datetime.now(timezone.utc).replace(tzinfo=None)
                     notification.email_error = None
                     db.session.commit()
                     stats["emails_sent"] += 1

@@ -6,7 +6,7 @@ import os
 import uuid
 import re
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from flask import (
@@ -374,7 +374,7 @@ def correct_extraction(document_id):
     payload["field_confidences"] = confs
     manual = payload.get("manual_corrections", {}).copy()
     for key, change in changes.items():
-        manual[key] = {"from": change["from"], "to": change["to"], "updated_at": datetime.utcnow().isoformat()}
+        manual[key] = {"from": change["from"], "to": change["to"], "updated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat()}
     payload["manual_corrections"] = manual
     doc.extracted_data = payload
     try:
@@ -618,7 +618,7 @@ def submit_claim_email(claim_id):
     claim.manufacturer_name = manufacturer_name
     claim.manufacturer_email = manufacturer_email
     claim.submission_channel = submission_channel
-    claim.submitted_at = datetime.utcnow()
+    claim.submitted_at = datetime.now(timezone.utc).replace(tzinfo=None)
     claim.submission_message_id = message_id
     claim.submission_error = None
 
@@ -715,7 +715,7 @@ def settings():
 @login_required
 def export_json():
     products = Product.query.filter_by(user_id=current_user.id).all()
-    payload = {"exported_at": datetime.utcnow().isoformat() + "Z", "account": current_user.email, "products": []}
+    payload = {"exported_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), "account": current_user.email, "products": []}
     for p in products:
         payload["products"].append({
             "product": {"name": p.name, "brand": p.brand, "category": p.category, "serial_number": p.serial_number,

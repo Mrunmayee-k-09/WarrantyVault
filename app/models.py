@@ -1,7 +1,11 @@
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from flask_login import UserMixin
 from werkzeug.security import check_password_hash, generate_password_hash
 from .extensions import db, login_manager
+
+def utcnow():
+    """Return current UTC time as a naive datetime for database compatibility."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class User(UserMixin, db.Model):
@@ -12,7 +16,7 @@ class User(UserMixin, db.Model):
     reminder_days = db.Column(db.Integer, default=30, nullable=False)
     reminder_email_enabled = db.Column(db.Boolean, default=False, nullable=False)
     reminder_email = db.Column(db.String(180))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
 
     products = db.relationship("Product", backref="owner", lazy=True, cascade="all, delete-orphan")
     notifications = db.relationship("Notification", backref="owner", lazy=True, cascade="all, delete-orphan")
@@ -45,9 +49,13 @@ class Product(db.Model):
     warranty_expiry = db.Column(db.Date)
     warranty_months = db.Column(db.Integer)
     notes = db.Column(db.Text)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
-
+    created_at = db.Column(db.DateTime,default=utcnow, nullable=False)
+    updated_at = db.Column(
+    db.DateTime,
+    default=utcnow,
+    onupdate=utcnow,
+    nullable=False
+)
     documents = db.relationship("Document", backref="product", lazy=True, cascade="all, delete-orphan")
     claims = db.relationship("Claim", backref="product", lazy=True, cascade="all, delete-orphan")
     verifications = db.relationship("Verification", backref="product", lazy=True, cascade="all, delete-orphan")
@@ -82,7 +90,7 @@ class Document(db.Model):
     extraction_confidence = db.Column(db.String(20), default="LOW")
     extraction_notes = db.Column(db.Text)
     file_size = db.Column(db.Integer, default=0)
-    uploaded_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    uploaded_at = db.Column(db.DateTime,default=utcnow, nullable=False)
 
     verifications = db.relationship("Verification", backref="document", lazy=True, cascade="all, delete-orphan")
 
@@ -96,7 +104,7 @@ class Verification(db.Model):
     summary = db.Column(db.Text)
     notes = db.Column(db.JSON, default=list)
     rules_version = db.Column(db.String(30), default="1.0")
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
     fields = db.relationship("VerificationField", backref="verification", lazy=True, cascade="all, delete-orphan", order_by="VerificationField.id")
 
 
@@ -121,8 +129,8 @@ class Claim(db.Model):
     status = db.Column(db.String(30), default="Draft", nullable=False)
     attachment_name = db.Column(db.String(255))
     attachment_path = db.Column(db.String(255))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow, nullable=False)
     manufacturer_name = db.Column(db.String(180))
     manufacturer_email = db.Column(db.String(180))
     submission_channel = db.Column(db.String(30))
@@ -142,7 +150,7 @@ class Notification(db.Model):
     event_key = db.Column(db.String(255))
     email_sent_at = db.Column(db.DateTime)
     email_error = db.Column(db.Text)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
 
 
 class AuditLog(db.Model):
@@ -152,4 +160,4 @@ class AuditLog(db.Model):
     entity_id = db.Column(db.Integer, nullable=False)
     action = db.Column(db.String(80), nullable=False)
     details = db.Column(db.JSON, default=dict)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
