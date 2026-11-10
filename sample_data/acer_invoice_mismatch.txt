@@ -1,0 +1,14 @@
+SAMPLE ELECTRONIC TAX INVOICE
+Invoice Number: INV-2026-0410-08
+Date: 10/04/2026
+
+Brand: Acer
+Retailer: SAMPLE ELECTRONICS STORE
+Model Number: NL16-71G-54MY
+Serial Number: NHD5ASI001526040482N99
+
+Product: Acer Nitro Lite Laptop
+Purchase Price: INR 54990.00
+
+This synthetic test invoice intentionally contains a different retailer and serial number.
+It is for demonstration only and is not a real invoice.
