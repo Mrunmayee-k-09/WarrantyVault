@@ -1,6 +1,6 @@
 {% extends 'base.html' %}{% block title %}Dashboard · WarrantyVault{% endblock %}{% block breadcrumb %}Dashboard{% endblock %}
 {% block content %}
-<div class="page-heading heading-with-action"><div><div class="eyebrow">TUESDAY, {{ now().strftime('%d %B %Y') if now is defined else '' }}</div><h1>Good to see you, {{ current_user.name.split(' ')[0] }}.</h1><p class="muted">Here's the latest across your warranty vault.</p></div><a class="btn btn-primary" href="{{ url_for('main.new_product') }}"><span>＋</span> Add a product</a></div>
+<div class="page-heading heading-with-action"><div><div class="eyebrow">{{ now().strftime('%A, %d %B %Y') if now is defined else '' }}</div><h1>Good to see you, {{ current_user.name.split(' ')[0] }}.</h1><p class="muted">Here's the latest across your warranty vault.</p></div><a class="btn btn-primary" href="{{ url_for('main.new_product') }}"><span>＋</span> Add a product</a></div>
 <div class="stats-grid">
   <div class="stat-card"><div class="stat-top"><span class="stat-icon blue">▣</span><span class="stat-label">TOTAL PRODUCTS</span></div><div class="stat-value">{{ total }}</div><div class="stat-foot">Items in your vault</div></div>
   <div class="stat-card"><div class="stat-top"><span class="stat-icon green">✓</span><span class="stat-label">ACTIVE WARRANTIES</span></div><div class="stat-value">{{ active }}</div><div class="stat-foot">More than 30 days remaining</div></div>
