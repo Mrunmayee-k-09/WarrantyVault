@@ -1,0 +1,85 @@
+
+{% extends 'base.html' %}
+
+{% block title %}Review Product Details · WarrantyVault{% endblock %}
+
+{% block breadcrumb %}
+<a href="{{ url_for('main.documents') }}">Documents</a>
+<span>/</span>
+Review product details
+{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+    <div>
+        <a class="back-link" href="{{ url_for('main.document_report', document_id=document.id) }}">← Back to document</a>
+        <div class="eyebrow">SMART AUTO-FILL</div>
+        <h1>Review product details</h1>
+        <p class="muted">Compare the extracted invoice information with your saved product record.</p>
+    </div>
+</div>
+
+<div class="panel">
+    <div class="panel-heading">
+        <div>
+            <h3>{{ product.name }}</h3>
+            <p>Invoice: {{ document.original_name }}</p>
+        </div>
+        <span class="count-pill">{{ suggestions|length }} suggestions</span>
+    </div>
+
+    {% if suggestions %}
+    <div class="inline-alert amber-alert">
+        <b>Review before applying changes</b>
+        <p>These are suggestions extracted from your invoice. Select only the values you want to update. Your approval is required.</p>
+    </div>
+
+    <form method="post"
+          action="{{ url_for('main.apply_product_autofill', document_id=document.id) }}">
+
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+        <div class="extracted-grid">
+            {% for item in suggestions %}
+            <div class="panel">
+                <label>
+                    <input type="checkbox" name="fields" value="{{ item.field }}">
+                    <b>{{ item.label }}</b>
+                </label>
+
+                <p class="muted">Current value</p>
+                <p>{{ item.current }}</p>
+
+                <p class="muted">Invoice value</p>
+                <p><b>{{ item.suggested }}</b></p>
+
+                <span class="confidence confidence-{{ item.confidence|lower }}">
+                    {{ item.confidence }} confidence
+                </span>
+            </div>
+            {% endfor %}
+        </div>
+
+        <div class="form-actions">
+            <a class="btn btn-secondary"
+               href="{{ url_for('main.document_report', document_id=document.id) }}">
+                Cancel
+            </a>
+            <button class="btn btn-primary" type="submit">
+                Apply selected changes
+            </button>
+        </div>
+    </form>
+
+    {% else %}
+    <div class="empty-state">
+        <h3>No corrections suggested</h3>
+        <p>Your extracted invoice values either match the saved product information or no usable differences were found.</p>
+        <a class="btn btn-secondary"
+           href="{{ url_for('main.document_report', document_id=document.id) }}">
+            Back to document
+        </a>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

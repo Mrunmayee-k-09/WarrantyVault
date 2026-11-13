@@ -222,3 +222,122 @@ def test_scanned_pdf_pages_are_passed_to_ocr(logged_in_client, app, monkeypatch,
     assert "Scanned PDF OCR ran" in notes
     assert any("not document authenticity" in note for note in notes)
     assert score == 91.0
+
+
+def _create_autofill_test_document(logged_in_client):
+    """Create a product and invoice with fields that can be auto-filled."""
+    logged_in_client.post("/products/new", data={
+        "name": "AutoFill Test Laptop",
+        "brand": "Acer",
+        "retailer": "Original Store",
+        "serial_number": "SERIAL-ORIGINAL",
+        "purchase_date": "2026-04-10",
+        "purchase_price": "54990",
+        "invoice_number": "INV-TEST-001",
+    }, follow_redirects=True)
+
+    invoice = (
+        b"Invoice Number: INV-TEST-001\n"
+        b"Date: 10/04/2026\n"
+        b"Brand: Acer\n"
+        b"Retailer: Invoice Store\n"
+        b"Serial Number: SERIAL-INVOICE\n"
+        b"Purchase Price: INR 54990.00\n"
+    )
+
+    response = logged_in_client.post(
+        "/products/1/documents",
+        data={
+            "document_type": "Invoice",
+            "document": (BytesIO(invoice), "autofill-test.txt"),
+        },
+        content_type="multipart/form-data",
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    return 1
+
+
+def test_autofill_updates_only_user_selected_fields(logged_in_client, app):
+    from app.models import AuditLog
+
+    document_id = _create_autofill_test_document(logged_in_client)
+
+    response = logged_in_client.post(
+        f"/documents/{document_id}/autofill",
+        data={"fields": ["retailer"]},
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+
+    with app.app_context():
+        product = Product.query.first()
+
+        assert product.retailer == "Invoice Store"
+        assert product.serial_number == "SERIAL-ORIGINAL"
+
+        assert AuditLog.query.filter_by(
+            action="invoice_autofill_applied"
+        ).count() == 1
+
+        assert Verification.query.filter_by(
+            document_id=document_id
+        ).count() == 1
+
+
+def test_autofill_preserves_previous_verification_history(
+    logged_in_client, app
+):
+    document_id = _create_autofill_test_document(logged_in_client)
+
+    # Create the original verification.
+    response = logged_in_client.post(
+        f"/documents/{document_id}/verify",
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+
+    # Approve a retailer update.
+    response = logged_in_client.post(
+        f"/documents/{document_id}/autofill",
+        data={"fields": ["retailer"]},
+        follow_redirects=True,
+    )
+    assert response.status_code == 200
+
+    with app.app_context():
+        history = Verification.query.filter_by(
+            document_id=document_id
+        ).all()
+
+        assert len(history) == 2
+
+
+def test_autofill_rejects_access_to_another_users_document(
+    logged_in_client, app
+):
+    from app.models import User
+
+    document_id = _create_autofill_test_document(logged_in_client)
+
+    # Sign out the original user.
+    logged_in_client.post("/logout")
+
+    # Register a different user.
+    response = logged_in_client.post("/register", data={
+        "name": "Another User",
+        "email": "another@example.com",
+        "password": "password123",
+        "confirm_password": "password123",
+    })
+    assert response.status_code in (200, 302)
+
+    # The second user must not update the first user's document.
+    response = logged_in_client.post(
+        f"/documents/{document_id}/autofill",
+        data={"fields": ["retailer"]},
+    )
+
+    assert response.status_code == 404

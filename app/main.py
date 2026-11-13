@@ -343,6 +343,181 @@ def document_report(document_id):
     return render_template("document_report.html", document=doc, latest=latest, history=history)
 
 
+@main_bp.get("/documents/<int:document_id>/autofill")
+@login_required
+def review_product_autofill(document_id):
+    doc = _owned_document(document_id)
+    product = doc.product
+
+    extracted_fields = (doc.extracted_data or {}).get("fields", {})
+    confidence_map = (doc.extracted_data or {}).get("field_confidences", {})
+
+    field_mapping = {
+        "brand": "brand",
+        "retailer": "retailer",
+        "model_number": "model_number",
+        "serial_number": "serial_number",
+        "purchase_date": "purchase_date",
+        "purchase_price": "purchase_price",
+        "invoice_number": "invoice_number",
+    }
+
+    suggestions = []
+
+    for invoice_field, product_field in field_mapping.items():
+        invoice_value = extracted_fields.get(invoice_field)
+
+        if invoice_value is None or not str(invoice_value).strip():
+            continue
+
+        current_value = getattr(product, product_field)
+        confidence = confidence_map.get(invoice_field, "LOW")
+
+        if product_field == "purchase_date":
+            invoice_value = _parse_date(str(invoice_value))
+            if invoice_value is None:
+                continue
+
+        elif product_field == "purchase_price":
+            invoice_value = _parse_float(str(invoice_value))
+            if invoice_value is None:
+                continue
+
+        current_display = (
+            current_value.isoformat()
+            if isinstance(current_value, date)
+            else str(current_value) if current_value is not None else ""
+        )
+
+        invoice_display = (
+            invoice_value.isoformat()
+            if isinstance(invoice_value, date)
+            else str(invoice_value)
+        )
+
+        if current_display != invoice_display:
+            suggestions.append({
+                "field": product_field,
+                "label": product_field.replace("_", " ").title(),
+                "current": current_display or "Not provided",
+                "suggested": invoice_display,
+                "confidence": confidence,
+            })
+
+    return render_template(
+        "autofill_review.html",
+        document=doc,
+        product=product,
+        suggestions=suggestions,
+    )
+
+
+@main_bp.post("/documents/<int:document_id>/autofill")
+@login_required
+def apply_product_autofill(document_id):
+    doc = _owned_document(document_id)
+    product = doc.product
+
+    extracted_fields = (doc.extracted_data or {}).get("fields", {})
+
+    field_mapping = {
+        "brand": ("brand", 120),
+        "retailer": ("retailer", 180),
+        "model_number": ("model_number", 140),
+        "serial_number": ("serial_number", 140),
+        "purchase_date": ("purchase_date", None),
+        "purchase_price": ("purchase_price", None),
+        "invoice_number": ("invoice_number", 100),
+    }
+
+    selected_fields = set(request.form.getlist("fields"))
+    changes = {}
+
+    if not selected_fields:
+        flash("Select at least one field to update.", "warning")
+        return redirect(url_for(
+            "main.review_product_autofill",
+            document_id=doc.id
+        ))
+
+    if not selected_fields.issubset(field_mapping):
+        abort(400)
+
+    for invoice_field in selected_fields:
+        product_field, max_length = field_mapping[invoice_field]
+        raw_value = extracted_fields.get(invoice_field)
+
+        if raw_value is None or not str(raw_value).strip():
+            continue
+
+        if product_field == "purchase_date":
+            new_value = _parse_date(str(raw_value))
+            if new_value is None:
+                continue
+
+        elif product_field == "purchase_price":
+            new_value = _parse_float(str(raw_value))
+            if new_value is None:
+                continue
+
+        else:
+            new_value = str(raw_value).strip()
+            if len(new_value) > max_length:
+                continue
+
+        old_value = getattr(product, product_field)
+
+        if old_value != new_value:
+            changes[product_field] = {
+                "from": (
+                    old_value.isoformat()
+                    if isinstance(old_value, date)
+                    else old_value
+                ),
+                "to": (
+                    new_value.isoformat()
+                    if isinstance(new_value, date)
+                    else new_value
+                ),
+            }
+
+            setattr(product, product_field, new_value)
+
+    if not changes:
+        flash("No valid changes were available to apply.", "warning")
+        return redirect(url_for(
+            "main.document_report",
+            document_id=doc.id
+        ))
+
+    _audit(
+        "product",
+        product.id,
+        "invoice_autofill_applied",
+        {
+            "document_id": doc.id,
+            "changes": changes,
+            "user_approved": True,
+        },
+    )
+
+    db.session.commit()
+
+    verification = _run_verification(doc)
+
+    flash(
+        "Approved product details updated successfully. "
+        "A new verification record has been created.",
+        "success",
+    )
+
+    return redirect(url_for(
+        "main.verification_report",
+        verification_id=verification.id
+    ))
+
+
+
 @main_bp.get("/verifications/<int:verification_id>")
 @login_required
 def verification_report(verification_id):
