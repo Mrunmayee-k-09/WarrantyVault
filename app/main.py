@@ -1,4 +1,4 @@
-
+import math
 import csv
 import io
 import json
@@ -49,22 +49,48 @@ def _audit(entity_type, entity_id, action, details=None):
     db.session.add(AuditLog(user_id=current_user.id, entity_type=entity_type, entity_id=entity_id, action=action, details=details or {}))
 
 
+
 def _parse_date(value):
     if not value:
         return None
-    try:
-        return date.fromisoformat(value)
-    except ValueError:
-        return None
+
+    value = str(value).strip()
+
+    date_formats = [
+        "%Y-%m-%d",  # 2026-04-10
+        "%d/%m/%Y",  # 10/04/2026
+        "%d-%m-%Y",  # 10-04-2026
+        "%d/%m/%y",  # 10/04/26
+    ]
+
+    for date_format in date_formats:
+        try:
+            return datetime.strptime(value, date_format).date()
+        except ValueError:
+            continue
+
+    return None
+
+
 
 
 def _parse_float(value):
     if not value:
         return None
+
     try:
-        return float(value.replace(",", "").replace("₹", "").strip())
+        parsed_value = float(
+            value.replace(",", "").replace("₹", "").strip()
+        )
+
+        if not math.isfinite(parsed_value):
+            return None
+
+        return parsed_value
+
     except (ValueError, AttributeError):
         return None
+
 
 
 def _save_upload(file_storage):
@@ -112,8 +138,8 @@ def _run_verification(doc):
             review_required=item["review_required"], value_source=item.get("value_source", "OCR"), reason=item["reason"],
         ))
     doc.status = "Verified" if overall == "VERIFIED" else "Review required" if overall in {"REVIEW_REQUIRED", "UNABLE_TO_VERIFY"} else "Mismatch found"
-    _audit("document", doc.id, "verification_created", {"verification_id": verification.id, "result": overall})
-    db.session.commit()
+    _audit("document",doc.id,"verification_created",{"verification_id": verification.id,"result": overall,},
+    )
     return verification
 
 
@@ -322,16 +348,50 @@ def retry_document(document_id):
     return redirect(request.referrer or url_for("main.documents"))
 
 
+
 @main_bp.post("/documents/<int:document_id>/verify")
 @login_required
 def verify_document(document_id):
     doc = _owned_document(document_id)
+
     if not (doc.extracted_data or {}).get("fields"):
-        flash("No extracted fields are available. Review the document or retry processing first.", "warning")
-        return redirect(url_for("main.document_report", document_id=doc.id))
-    verification = _run_verification(doc)
-    flash("Verification completed. This result checks consistency, not authenticity.", "success")
-    return redirect(url_for("main.verification_report", verification_id=verification.id))
+        flash(
+            "No extracted fields are available. Review the document "
+            "or retry processing first.",
+            "warning",
+        )
+        return redirect(url_for(
+            "main.document_report",
+            document_id=doc.id,
+        ))
+
+    try:
+        verification = _run_verification(doc)
+        db.session.commit()
+
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception(
+            "Verification failed for document %s",
+            doc.id,
+        )
+        flash("Verification failed. No changes were saved.", "danger")
+        return redirect(url_for(
+            "main.document_report",
+            document_id=doc.id,
+        ))
+
+    flash(
+        "Verification completed. This result checks consistency, "
+        "not authenticity.",
+        "success",
+    )
+
+    return redirect(url_for(
+        "main.verification_report",
+        verification_id=verification.id,
+    ))
+
 
 
 @main_bp.get("/documents/<int:document_id>/report")
@@ -412,6 +472,7 @@ def review_product_autofill(document_id):
     )
 
 
+
 @main_bp.post("/documents/<int:document_id>/autofill")
 @login_required
 def apply_product_autofill(document_id):
@@ -490,20 +551,36 @@ def apply_product_autofill(document_id):
             document_id=doc.id
         ))
 
-    _audit(
-        "product",
-        product.id,
-        "invoice_autofill_applied",
-        {
-            "document_id": doc.id,
-            "changes": changes,
-            "user_approved": True,
-        },
-    )
+    try:
+        _audit(
+            "product",
+            product.id,
+            "invoice_autofill_applied",
+            {
+                "document_id": doc.id,
+                "changes": changes,
+                "user_approved": True,
+            },
+        )
 
-    db.session.commit()
+        verification = _run_verification(doc)
 
-    verification = _run_verification(doc)
+        db.session.commit()
+
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception(
+            "AutoFill failed for document %s",
+            doc.id,
+        )
+        flash(
+            "AutoFill failed. No changes were saved.",
+            "danger",
+        )
+        return redirect(url_for(
+            "main.document_report",
+            document_id=doc.id,
+        ))
 
     flash(
         "Approved product details updated successfully. "
@@ -515,6 +592,7 @@ def apply_product_autofill(document_id):
         "main.verification_report",
         verification_id=verification.id
     ))
+
 
 
 

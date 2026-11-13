@@ -341,3 +341,120 @@ def test_autofill_rejects_access_to_another_users_document(
     )
 
     assert response.status_code == 404
+
+
+
+def test_autofill_rejects_empty_field_selection(logged_in_client, app):
+    from app.models import AuditLog
+
+    document_id = _create_autofill_test_document(logged_in_client)
+
+    response = logged_in_client.post(
+        f"/documents/{document_id}/autofill",
+        data={},
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert b"Select at least one field" in response.data
+
+    with app.app_context():
+        product = Product.query.first()
+
+        assert product.retailer == "Original Store"
+
+        assert AuditLog.query.filter_by(
+            action="invoice_autofill_applied"
+        ).count() == 0
+
+
+def test_autofill_rejects_invalid_field_name(logged_in_client, app):
+    document_id = _create_autofill_test_document(logged_in_client)
+
+    response = logged_in_client.post(
+        f"/documents/{document_id}/autofill",
+        data={"fields": ["password"]},
+    )
+
+    assert response.status_code == 400
+
+    with app.app_context():
+        product = Product.query.first()
+
+        assert product.retailer == "Original Store"
+        assert product.serial_number == "SERIAL-ORIGINAL"
+
+
+
+def test_parse_float_rejects_non_finite_values():
+    from app.main import _parse_float
+
+    assert _parse_float("NaN") is None
+    assert _parse_float("Infinity") is None
+    assert _parse_float("-Infinity") is None
+
+    assert _parse_float("54990") == 54990.0
+    assert _parse_float("54,990") == 54990.0
+    assert _parse_float("₹54,990") == 54990.0
+    assert _parse_float("invalid") is None
+
+
+
+def test_parse_date_accepts_iso_format_and_rejects_invalid_dates():
+    from datetime import date
+    from app.main import _parse_date
+
+    assert _parse_date("2026-04-10") == date(2026, 4, 10)
+    assert _parse_date("not-a-date") is None
+    assert _parse_date("2026-02-30") is None
+    assert _parse_date("") is None
+
+
+def test_parse_date_supports_common_invoice_formats():
+    from datetime import date
+    from app.main import _parse_date
+
+    assert _parse_date("2026-04-10") == date(2026, 4, 10)
+    assert _parse_date("10/04/2026") == date(2026, 4, 10)
+    assert _parse_date("10-04-2026") == date(2026, 4, 10)
+    assert _parse_date("10/04/26") == date(2026, 4, 10)
+
+
+def test_autofill_rolls_back_product_and_audit_if_verification_fails(
+    logged_in_client, app, monkeypatch
+):
+    from app.models import AuditLog
+    import app.main as main_module
+
+    document_id = _create_autofill_test_document(logged_in_client)
+
+    def fail_verification(doc):
+        raise RuntimeError("Simulated verification failure")
+
+    monkeypatch.setattr(
+        main_module,
+        "_run_verification",
+        fail_verification,
+    )
+
+    response = logged_in_client.post(
+        f"/documents/{document_id}/autofill",
+        data={"fields": ["retailer"]},
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert b"AutoFill failed. No changes were saved." in response.data
+
+    with app.app_context():
+        product = Product.query.first()
+
+        assert product.retailer == "Original Store"
+
+        assert AuditLog.query.filter_by(
+            action="invoice_autofill_applied"
+        ).count() == 0
+
+        assert Verification.query.filter_by(
+            document_id=document_id
+        ).count() == 0
