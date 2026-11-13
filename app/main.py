@@ -25,9 +25,63 @@ from .models import (
 from .services.extraction import process_document
 from .services.verification import build_verification
 from .services.mailer import smtp_is_configured, send_email
+from itsdangerous import (
+    URLSafeTimedSerializer,
+    BadSignature,
+    SignatureExpired,
+)
 
 
 main_bp = Blueprint("main", __name__)
+
+def _create_autofill_snapshot_token(document_id, extracted_fields, product):
+    serializer = URLSafeTimedSerializer(current_app.config["SECRET_KEY"])
+
+    snapshot = {
+        "document_id": document_id,
+        "extracted_fields": {
+            field: extracted_fields.get(field)
+            for field in (
+                "brand",
+                "retailer",
+                "model_number",
+                "serial_number",
+                "purchase_date",
+                "purchase_price",
+                "invoice_number",
+            )
+        },
+        "product_id": product.id,
+        "product_values": {
+            field: (
+                getattr(product, field).isoformat()
+                if isinstance(getattr(product, field), date)
+                else getattr(product, field)
+            )
+            for field in (
+                "brand",
+                "retailer",
+                "model_number",
+                "serial_number",
+                "purchase_date",
+                "purchase_price",
+                "invoice_number",
+            )
+        },
+    }
+
+    return serializer.dumps(snapshot, salt="autofill-review")
+
+
+def _verify_autofill_snapshot_token(token, max_age=600):
+    serializer = URLSafeTimedSerializer(current_app.config["SECRET_KEY"])
+
+    return serializer.loads(
+        token,
+        salt="autofill-review",
+        max_age=max_age,
+    )
+
 
 
 def _owned_product(product_id):
@@ -75,13 +129,39 @@ def _parse_date(value):
 
 
 def _parse_float(value):
+    if value is None:
+        return None
+
+    value = str(value).strip()
+
     if not value:
         return None
 
+    # Remove the rupee symbol and surrounding whitespace.
+    value = value.replace("₹", "").strip()
+
+    # Reject negative values.
+    if value.startswith("-"):
+        return None
+
+    # Accept either:
+    # 54990
+    # 54990.50
+    # 54,990.50
+    # 12,34,567.50
+    # 1,234,567.50
+    import re
+
+    valid_number = re.fullmatch(
+    r"(?:\d+|\d{1,3}(?:,\d{3})+|\d{1,2}(?:,\d{2})*,\d{3})(?:\.\d+)?",
+    value
+)
+
+    if not valid_number:
+        return None
+
     try:
-        parsed_value = float(
-            value.replace(",", "").replace("₹", "").strip()
-        )
+        parsed_value = float(value.replace(",", ""))
 
         if not math.isfinite(parsed_value):
             return None
@@ -464,22 +544,72 @@ def review_product_autofill(document_id):
                 "confidence": confidence,
             })
 
+    snapshot_token = _create_autofill_snapshot_token(
+    doc.id,
+    extracted_fields,
+    product,
+)
+
     return render_template(
-        "autofill_review.html",
-        document=doc,
-        product=product,
-        suggestions=suggestions,
-    )
+    "autofill_review.html",
+    document=doc,
+    product=product,
+    suggestions=suggestions,
+    snapshot_token=snapshot_token,
+)
+
 
 
 
 @main_bp.post("/documents/<int:document_id>/autofill")
 @login_required
+
 def apply_product_autofill(document_id):
     doc = _owned_document(document_id)
     product = doc.product
 
+    # Verify the signed snapshot submitted with the approval.
+    token = request.form.get("snapshot_token", "")
+
+    try:
+        approved_snapshot = _verify_autofill_snapshot_token(token)
+
+    except (SignatureExpired, BadSignature):
+        flash(
+            "Your review has expired or is invalid. "
+            "Please review the suggestions again.",
+            "warning",
+        )
+        return redirect(url_for(
+            "main.review_product_autofill",
+            document_id=doc.id,
+        ))
+
+    # Generate a snapshot of the current document and product.
+    current_snapshot_token = _create_autofill_snapshot_token(
+        doc.id,
+        (doc.extracted_data or {}).get("fields", {}),
+        product,
+    )
+
+    current_snapshot = _verify_autofill_snapshot_token(
+        current_snapshot_token
+    )
+
+    # Reject approval if the reviewed information has changed.
+    if approved_snapshot != current_snapshot:
+        flash(
+            "The invoice or product information changed after your review. "
+            "Please review the suggestions again.",
+            "warning",
+        )
+        return redirect(url_for(
+            "main.review_product_autofill",
+            document_id=doc.id,
+        ))
+
     extracted_fields = (doc.extracted_data or {}).get("fields", {})
+
 
     field_mapping = {
         "brand": ("brand", 120),

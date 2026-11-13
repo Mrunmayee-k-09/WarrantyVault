@@ -259,16 +259,58 @@ def _create_autofill_test_document(logged_in_client):
     return 1
 
 
+from html.parser import HTMLParser
+
+
+def _post_autofill(client, document_id, data=None, follow_redirects=True):
+    """Fetch a fresh review token and submit the AutoFill approval."""
+
+    class SnapshotTokenParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.token = None
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "input":
+                attributes = dict(attrs)
+                if attributes.get("name") == "snapshot_token":
+                    self.token = attributes.get("value")
+
+    # Open the review page to obtain its signed snapshot token.
+    response = client.get(
+        f"/documents/{document_id}/autofill"
+    )
+
+    assert response.status_code == 200
+
+    parser = SnapshotTokenParser()
+    parser.feed(response.get_data(as_text=True))
+
+    assert parser.token, "AutoFill snapshot token was not found."
+
+    # Include the token in the approval submission.
+    form_data = dict(data or {})
+    form_data["snapshot_token"] = parser.token
+
+    return client.post(
+        f"/documents/{document_id}/autofill",
+        data=form_data,
+        follow_redirects=follow_redirects,
+    )
+
+
+
 def test_autofill_updates_only_user_selected_fields(logged_in_client, app):
     from app.models import AuditLog
 
     document_id = _create_autofill_test_document(logged_in_client)
 
-    response = logged_in_client.post(
-        f"/documents/{document_id}/autofill",
-        data={"fields": ["retailer"]},
-        follow_redirects=True,
-    )
+    response = _post_autofill(
+    logged_in_client,
+    document_id,
+    data={"fields": ["retailer"]},
+    follow_redirects=True,
+)
 
     assert response.status_code == 200
 
@@ -300,11 +342,12 @@ def test_autofill_preserves_previous_verification_history(
     assert response.status_code == 200
 
     # Approve a retailer update.
-    response = logged_in_client.post(
-        f"/documents/{document_id}/autofill",
-        data={"fields": ["retailer"]},
-        follow_redirects=True,
-    )
+    response = _post_autofill(
+    logged_in_client,
+    document_id,
+    data={"fields": ["retailer"]},
+    follow_redirects=True,
+)
     assert response.status_code == 200
 
     with app.app_context():
@@ -349,8 +392,9 @@ def test_autofill_rejects_empty_field_selection(logged_in_client, app):
 
     document_id = _create_autofill_test_document(logged_in_client)
 
-    response = logged_in_client.post(
-        f"/documents/{document_id}/autofill",
+    response = _post_autofill(
+        logged_in_client,
+        document_id,
         data={},
         follow_redirects=True,
     )
@@ -371,9 +415,11 @@ def test_autofill_rejects_empty_field_selection(logged_in_client, app):
 def test_autofill_rejects_invalid_field_name(logged_in_client, app):
     document_id = _create_autofill_test_document(logged_in_client)
 
-    response = logged_in_client.post(
-        f"/documents/{document_id}/autofill",
+    response = _post_autofill(
+        logged_in_client,
+        document_id,
         data={"fields": ["password"]},
+        follow_redirects=False,
     )
 
     assert response.status_code == 400
@@ -437,11 +483,12 @@ def test_autofill_rolls_back_product_and_audit_if_verification_fails(
         fail_verification,
     )
 
-    response = logged_in_client.post(
-        f"/documents/{document_id}/autofill",
-        data={"fields": ["retailer"]},
-        follow_redirects=True,
-    )
+    response = _post_autofill(
+    logged_in_client,
+    document_id,
+    data={"fields": ["retailer"]},
+    follow_redirects=True,
+)
 
     assert response.status_code == 200
     assert b"AutoFill failed. No changes were saved." in response.data
@@ -457,4 +504,588 @@ def test_autofill_rolls_back_product_and_audit_if_verification_fails(
 
         assert Verification.query.filter_by(
             document_id=document_id
+        ).count() == 0
+
+
+
+def test_failed_autofill_preserves_existing_verification_history(
+    logged_in_client, app, monkeypatch
+):
+    from app.models import AuditLog
+    import app.main as main_module
+
+    document_id = _create_autofill_test_document(logged_in_client)
+
+    # Create an original successful verification.
+    response = logged_in_client.post(
+    f"/documents/{document_id}/verify",
+    follow_redirects=True,
+)
+    assert response.status_code == 200
+
+    with app.app_context():
+        original_history = Verification.query.filter_by(
+            document_id=document_id
+        ).all()
+
+        assert len(original_history) == 1
+        original_verification_id = original_history[0].id
+
+    # Force the next verification to fail.
+    def fail_verification(doc):
+        raise RuntimeError("Simulated verification failure")
+
+    monkeypatch.setattr(
+        main_module,
+        "_run_verification",
+        fail_verification,
+    )
+
+    response = _post_autofill(
+    logged_in_client,
+    document_id,
+    data={"fields": ["retailer"]},
+    follow_redirects=True,
+)
+
+    assert response.status_code == 200
+    assert b"AutoFill failed" in response.data
+
+    with app.app_context():
+        product = Product.query.first()
+
+        history = Verification.query.filter_by(
+            document_id=document_id
+        ).all()
+
+        assert product.retailer == "Original Store"
+        assert len(history) == 1
+        assert history[0].id == original_verification_id
+
+        assert AuditLog.query.filter_by(
+            action="invoice_autofill_applied"
+        ).count() == 0
+
+
+
+def test_parse_float_rejects_invalid_purchase_prices():
+    from app.main import _parse_float
+
+    # Valid prices
+    assert _parse_float("54990") == 54990.0
+    assert _parse_float("54990.50") == 54990.50
+    assert _parse_float("₹54,990") == 54990.0
+    assert _parse_float("12,34,567.50") == 1234567.50
+    assert _parse_float("1,234,567.50") == 1234567.50
+    assert _parse_float("0") == 0.0
+
+    # Invalid prices
+    assert _parse_float("-500") is None
+    assert _parse_float("abc123") is None
+    assert _parse_float("₹") is None
+    assert _parse_float("12,34,56") is None
+    assert _parse_float("1e309") is None
+    assert _parse_float("") is None
+    assert _parse_float("   ") is None
+
+
+def test_parse_date_handles_whitespace_and_rejects_unsupported_formats():
+    from datetime import date
+    from app.main import _parse_date
+
+    assert _parse_date("  10/04/2026  ") == date(2026, 4, 10)
+    assert _parse_date("04/10/2026") == date(2026, 10, 4)
+    assert _parse_date("2026/04/10") is None
+    assert _parse_date("10-Apr-2026") is None
+    assert _parse_date("   ") is None
+
+def test_autofill_rejects_oversized_text_values(logged_in_client, app):
+    from app.models import AuditLog
+
+    document_id = _create_autofill_test_document(logged_in_client)
+
+    with app.app_context():
+        document = db.session.get(Document, document_id)
+        extracted_data = document.extracted_data.copy()
+        extracted_fields = extracted_data.get("fields", {}).copy()
+
+        extracted_fields["retailer"] = "A" * 181
+
+        extracted_data["fields"] = extracted_fields
+        document.extracted_data = extracted_data
+        db.session.commit()
+
+    response = _post_autofill(
+    logged_in_client, document_id,
+    data={"fields": ["retailer"]},
+    follow_redirects=True,
+)
+
+    assert response.status_code == 200
+    assert b"No valid changes were available to apply." in response.data
+
+    with app.app_context():
+        product = Product.query.first()
+
+        assert product.retailer == "Original Store"
+
+        assert AuditLog.query.filter_by(
+            action="invoice_autofill_applied"
+        ).count() == 0
+
+        assert Verification.query.filter_by(
+            document_id=document_id
+        ).count() == 0
+
+def test_autofill_skips_oversized_field_but_updates_valid_field(
+    logged_in_client, app
+):
+    from app.models import AuditLog
+
+    document_id = _create_autofill_test_document(logged_in_client)
+
+    with app.app_context():
+        document = db.session.get(Document, document_id)
+
+        extracted_data = document.extracted_data.copy()
+        extracted_fields = extracted_data.get("fields", {}).copy()
+
+        # Invalid: exceeds retailer's 180-character limit.
+        extracted_fields["retailer"] = "A" * 181
+
+        # Valid: should still be applied.
+        extracted_fields["serial_number"] = "SERIAL-NEW-123"
+
+        extracted_data["fields"] = extracted_fields
+        document.extracted_data = extracted_data
+        db.session.commit()
+
+    response = _post_autofill(
+    logged_in_client, document_id,
+    data={"fields": ["retailer", "serial_number"]},
+    follow_redirects=True,
+)
+
+    assert response.status_code == 200
+
+    with app.app_context():
+        product = Product.query.first()
+
+        # Oversized retailer must remain unchanged.
+        assert product.retailer == "Original Store"
+
+        # Valid serial number must be updated.
+        assert product.serial_number == "SERIAL-NEW-123"
+
+        # Exactly one successful AutoFill audit.
+        assert AuditLog.query.filter_by(
+            action="invoice_autofill_applied"
+        ).count() == 1
+
+        # A verification record should be created.
+        assert Verification.query.filter_by(
+            document_id=document_id
+        ).count() == 1
+
+
+
+import pytest
+
+
+@pytest.mark.parametrize(
+    "invalid_price",
+    [
+        "-500",
+        "12,34,56",
+        "abc123",
+        "₹",
+    ],
+)
+def test_autofill_skips_invalid_purchase_price(
+    logged_in_client, app, invalid_price
+):
+    from app.models import AuditLog
+
+    document_id = _create_autofill_test_document(logged_in_client)
+
+    with app.app_context():
+        product = Product.query.first()
+        original_price = product.purchase_price
+
+        document = db.session.get(Document, document_id)
+
+        extracted_data = document.extracted_data.copy()
+        extracted_fields = extracted_data.get("fields", {}).copy()
+
+        extracted_fields["purchase_price"] = invalid_price
+
+        extracted_data["fields"] = extracted_fields
+        document.extracted_data = extracted_data
+        db.session.commit()
+
+    response = _post_autofill(
+    logged_in_client, document_id,
+    data={"fields": ["purchase_price"]},
+    follow_redirects=True,
+)
+
+    assert response.status_code == 200
+
+    with app.app_context():
+        product = Product.query.first()
+
+        assert product.purchase_price == original_price
+
+        assert AuditLog.query.filter_by(
+            action="invoice_autofill_applied"
+        ).count() == 0
+
+        assert Verification.query.filter_by(
+            document_id=document_id
+        ).count() == 0
+
+
+def test_autofill_skips_invalid_price_but_updates_valid_field(
+    logged_in_client, app
+):
+    from app.models import AuditLog
+
+    document_id = _create_autofill_test_document(logged_in_client)
+
+    with app.app_context():
+        product = Product.query.first()
+        original_price = product.purchase_price
+
+        document = db.session.get(Document, document_id)
+
+        extracted_data = document.extracted_data.copy()
+        extracted_fields = extracted_data.get("fields", {}).copy()
+
+        # Invalid: must not overwrite the original price.
+        extracted_fields["purchase_price"] = "-500"
+
+        # Valid: should still be applied.
+        extracted_fields["retailer"] = "New Invoice Store"
+
+        extracted_data["fields"] = extracted_fields
+        document.extracted_data = extracted_data
+        db.session.commit()
+
+    response = _post_autofill(
+    logged_in_client, document_id,
+    data={"fields": ["purchase_price", "retailer"]},
+    follow_redirects=True,
+)
+
+    assert response.status_code == 200
+
+    with app.app_context():
+        product = Product.query.first()
+
+        # Invalid price remains unchanged.
+        assert product.purchase_price == original_price
+
+        # Valid retailer is successfully updated.
+        assert product.retailer == "New Invoice Store"
+
+        # Successful AutoFill should be recorded.
+        assert AuditLog.query.filter_by(
+            action="invoice_autofill_applied"
+        ).count() == 1
+
+        # Verification should be created for the successful update.
+        assert Verification.query.filter_by(
+            document_id=document_id
+        ).count() == 1
+
+
+
+
+def test_autofill_accepts_text_at_maximum_allowed_length(
+    logged_in_client, app
+):
+    from app.models import AuditLog
+
+    document_id = _create_autofill_test_document(logged_in_client)
+
+    with app.app_context():
+        document = db.session.get(Document, document_id)
+
+        extracted_data = document.extracted_data.copy()
+        extracted_fields = extracted_data.get("fields", {}).copy()
+
+        valid_retailer = "A" * 180
+        extracted_fields["retailer"] = valid_retailer
+
+        extracted_data["fields"] = extracted_fields
+        document.extracted_data = extracted_data
+        db.session.commit()
+
+    response = _post_autofill(
+    logged_in_client, document_id,
+    data={"fields": ["retailer"]},
+    follow_redirects=True,
+)
+
+    assert response.status_code == 200
+
+    with app.app_context():
+        product = Product.query.first()
+
+        assert product.retailer == "A" * 180
+        assert len(product.retailer) == 180
+
+        assert AuditLog.query.filter_by(
+            action="invoice_autofill_applied"
+        ).count() == 1
+
+        assert Verification.query.filter_by(
+            document_id=document_id
+        ).count() == 1
+
+
+def test_autofill_rejects_missing_snapshot_token(logged_in_client, app):
+    from app.models import AuditLog
+
+    document_id = _create_autofill_test_document(logged_in_client)
+
+    # Submit an AutoFill approval without a snapshot token.
+    response = logged_in_client.post(
+        f"/documents/{document_id}/autofill",
+        data={"fields": ["retailer"]},
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert b"Your review has expired or is invalid" in response.data
+
+    with app.app_context():
+        product = Product.query.first()
+
+        assert product.retailer == "Original Store"
+
+        assert AuditLog.query.filter_by(
+            action="invoice_autofill_applied"
+        ).count() == 0
+
+
+
+def test_autofill_rejects_tampered_snapshot_token(logged_in_client, app):
+    from app.models import AuditLog
+    import re
+
+    document_id = _create_autofill_test_document(logged_in_client)
+
+    # Fetch a legitimate snapshot token.
+    review_response = logged_in_client.get(
+        f"/documents/{document_id}/autofill"
+    )
+    assert review_response.status_code == 200
+
+    html = review_response.get_data(as_text=True)
+    match = re.search(
+        r'name="snapshot_token"\s+value="([^"]+)"',
+        html,
+    )
+    assert match is not None
+
+    token = match.group(1)
+
+    # Change one character in the token.
+    tampered_token = token[:-1] + (
+        "A" if token[-1] != "A" else "B"
+    )
+
+    response = logged_in_client.post(
+        f"/documents/{document_id}/autofill",
+        data={
+            "fields": ["retailer"],
+            "snapshot_token": tampered_token,
+        },
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert b"Your review has expired or is invalid" in response.data
+
+    with app.app_context():
+        product = Product.query.first()
+        assert product.retailer == "Original Store"
+
+        assert AuditLog.query.filter_by(
+            action="invoice_autofill_applied"
+        ).count() == 0
+
+
+
+def test_autofill_rejects_expired_snapshot_token(logged_in_client, app):
+    from app.models import AuditLog
+    from itsdangerous import URLSafeTimedSerializer
+    from flask import current_app
+
+    document_id = _create_autofill_test_document(logged_in_client)
+
+    # Fetch a legitimate snapshot token.
+    review_response = logged_in_client.get(
+        f"/documents/{document_id}/autofill"
+    )
+    assert review_response.status_code == 200
+
+    html = review_response.get_data(as_text=True)
+
+    import re
+    match = re.search(
+        r'name="snapshot_token"\s+value="([^"]+)"',
+        html,
+    )
+    assert match is not None
+
+    # Generate a valid token, then backdate its timestamp.
+    with app.app_context():
+        serializer = URLSafeTimedSerializer(
+            current_app.config["SECRET_KEY"]
+        )
+
+        snapshot = serializer.loads(
+            match.group(1),
+            salt="autofill-review",
+        )
+
+        expired_token = serializer.dumps(
+            snapshot,
+            salt="autofill-review",
+        )
+
+    # The token must actually be expired. We'll test this
+    # by temporarily using a very small max_age in the route
+    # through a controlled timestamp adjustment.
+    import itsdangerous.timed
+
+    original_time = itsdangerous.timed.time.time
+    try:
+        itsdangerous.timed.time.time = lambda: original_time() + 601
+
+        response = logged_in_client.post(
+            f"/documents/{document_id}/autofill",
+            data={
+                "fields": ["retailer"],
+                "snapshot_token": expired_token,
+            },
+            follow_redirects=True,
+        )
+    finally:
+        itsdangerous.timed.time.time = original_time
+
+    assert response.status_code == 200
+    assert b"Your review has expired or is invalid" in response.data
+
+    with app.app_context():
+        product = Product.query.first()
+        assert product.retailer == "Original Store"
+
+        assert AuditLog.query.filter_by(
+            action="invoice_autofill_applied"
+        ).count() == 0
+
+
+def test_autofill_rejects_changed_invoice_after_review(logged_in_client, app):
+    from app.models import AuditLog, Document
+
+    document_id = _create_autofill_test_document(logged_in_client)
+
+    # Open the review page and obtain the original token.
+    review_response = logged_in_client.get(
+        f"/documents/{document_id}/autofill"
+    )
+    assert review_response.status_code == 200
+
+    html = review_response.get_data(as_text=True)
+    import re
+
+    match = re.search(
+        r'name="snapshot_token"\s+value="([^"]+)"',
+        html,
+    )
+    assert match is not None
+    original_token = match.group(1)
+
+    # Change the extracted invoice data after the review.
+    with app.app_context():
+        document = db.session.get(Document, document_id)
+        extracted_data = dict(document.extracted_data)
+        extracted_fields = dict(extracted_data["fields"])
+        extracted_fields["retailer"] = "Different Store"
+        extracted_data["fields"] = extracted_fields
+        document.extracted_data = extracted_data
+        db.session.commit()
+
+    # Submit approval using the old token.
+    response = logged_in_client.post(
+        f"/documents/{document_id}/autofill",
+        data={
+            "fields": ["retailer"],
+            "snapshot_token": original_token,
+        },
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert b"changed after your review" in response.data
+
+    with app.app_context():
+        product = Product.query.first()
+        assert product.retailer == "Original Store"
+
+        assert AuditLog.query.filter_by(
+            action="invoice_autofill_applied"
+        ).count() == 0
+
+
+
+def test_autofill_rejects_changed_product_after_review(logged_in_client, app):
+    from app.models import AuditLog, Product
+
+    document_id = _create_autofill_test_document(logged_in_client)
+
+    # Obtain the original review token.
+    review_response = logged_in_client.get(
+        f"/documents/{document_id}/autofill"
+    )
+    assert review_response.status_code == 200
+
+    import re
+
+    match = re.search(
+        r'name="snapshot_token"\s+value="([^"]+)"',
+        review_response.get_data(as_text=True),
+    )
+    assert match is not None
+    original_token = match.group(1)
+
+    # Change the product after the review.
+    with app.app_context():
+        product = Product.query.first()
+        product.retailer = "Manually Changed Store"
+        db.session.commit()
+
+    # Submit approval using the old token.
+    response = logged_in_client.post(
+        f"/documents/{document_id}/autofill",
+        data={
+            "fields": ["retailer"],
+            "snapshot_token": original_token,
+        },
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert b"changed after your review" in response.data
+
+    with app.app_context():
+        product = Product.query.first()
+
+        assert product.retailer == "Manually Changed Store"
+
+        assert AuditLog.query.filter_by(
+            action="invoice_autofill_applied"
         ).count() == 0

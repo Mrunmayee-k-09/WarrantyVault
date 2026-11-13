@@ -38,6 +38,7 @@ Review product details
           action="{{ url_for('main.apply_product_autofill', document_id=document.id) }}">
 
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="snapshot_token" value="{{ snapshot_token }}">
 
         <div class="extracted-grid">
             {% for item in suggestions %}
