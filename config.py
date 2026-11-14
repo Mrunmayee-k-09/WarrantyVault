@@ -19,23 +19,17 @@ class Config:
     CLAIM_SIMULATION_ALLOWED = os.getenv(
     "CLAIM_SIMULATION_ALLOWED", "false"
     ).lower() in {"1", "true", "yes"}
-    SECRET_KEY = os.getenv("SECRET_KEY")
+    
+SECRET_KEY = os.getenv("SECRET_KEY")
 
-    if not SECRET_KEY:
-        if os.getenv("FLASK_ENV") == "production":
-            raise RuntimeError(
+if not SECRET_KEY:
+    if os.getenv("FLASK_ENV") == "production":
+        raise RuntimeError(
             "SECRET_KEY must be set in production."
         )
 
     SECRET_KEY = "local-development-only-change-before-deployment"
 
-    if not SECRET_KEY:
-        if os.getenv("FLASK_ENV") == "production":
-            raise RuntimeError(
-            "SECRET_KEY must be set in production."
-        )
-
-    SECRET_KEY = "local-development-only-change-before-deployment"
     SQLALCHEMY_DATABASE_URI = os.getenv("DATABASE_URL", f"sqlite:///{BASE_DIR / 'instance' / 'warrantyvault.db'}")
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16 MB
