@@ -38,8 +38,9 @@ def create_app(test_config=None):
 
     @app.errorhandler(413)
     def too_large(_error):
-        from flask import flash, redirect, request, url_for
+        from flask import flash, redirect, url_for
+
         flash("That file is larger than the 16 MB upload limit.", "error")
-        return redirect(request.referrer or url_for("main.documents"))
+        return redirect(url_for("main.documents"))
 
     return app

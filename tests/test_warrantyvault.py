@@ -1,4 +1,5 @@
 from io import BytesIO
+from pathlib import Path
 from app.extensions import db
 from app.models import Product, Document, Verification
 
@@ -53,6 +54,63 @@ def test_upload_and_mismatch_verification(logged_in_client, app):
         assert outcomes["Serial number"] == "Mismatch"
         assert outcomes["Brand"] == "Match"
 
+def test_upload_rejects_file_with_mismatched_signature(logged_in_client, app):
+    logged_in_client.post("/products/new", data={
+        "name": "Test Laptop",
+        "brand": "Acer",
+    }, follow_redirects=True)
+
+    response = logged_in_client.post("/products/1/documents", data={
+        "document_type": "Invoice",
+        "document": (BytesIO(b"This is not a PDF"), "fake-invoice.pdf"),
+    }, content_type="multipart/form-data", follow_redirects=True)
+
+    assert response.status_code == 200
+    assert b"does not appear to match" in response.data
+
+    with app.app_context():
+        assert Document.query.count() == 0
+
+def test_upload_rejects_empty_file(logged_in_client, app):
+    logged_in_client.post("/products/new", data={
+        "name": "Test Laptop",
+        "brand": "Acer",
+    }, follow_redirects=True)
+
+    response = logged_in_client.post("/products/1/documents", data={
+        "document_type": "Invoice",
+        "document": (BytesIO(b""), "empty-invoice.txt"),
+    }, content_type="multipart/form-data", follow_redirects=True)
+
+    assert response.status_code == 200
+    assert b"uploaded file is empty" in response.data
+
+    with app.app_context():
+        assert Document.query.count() == 0
+
+def test_upload_accepts_valid_pdf_signature(logged_in_client, app):
+    logged_in_client.post("/products/new", data={
+        "name": "Test Laptop",
+        "brand": "Acer",
+    }, follow_redirects=True)
+
+    pdf_content = b"%PDF-1.4\nTest PDF content"
+
+    response = logged_in_client.post("/products/1/documents", data={
+        "document_type": "Invoice",
+        "document": (BytesIO(pdf_content), "invoice.pdf"),
+    }, content_type="multipart/form-data", follow_redirects=True)
+
+    assert response.status_code == 200
+
+    with app.app_context():
+        doc = Document.query.first()
+        assert doc is not None
+
+        saved_path = Path(app.config["UPLOAD_FOLDER"]) / doc.stored_name
+        assert saved_path.exists()
+        assert saved_path.read_bytes().startswith(b"%PDF-")
+
 
 def test_manual_correction_is_logged_and_source_file_unchanged(logged_in_client, app, tmp_path):
     logged_in_client.post("/products/new", data={"name": "Test Product", "brand": "Acer", "retailer": "Right Store"}, follow_redirects=True)
@@ -72,6 +130,138 @@ def test_manual_correction_is_logged_and_source_file_unchanged(logged_in_client,
         assert retailer_field.value_source == "Manual correction"
         assert AuditLog.query.filter_by(action="extraction_corrected").count() == 1
         assert "Wrong Store" in open(f"{app.config['UPLOAD_FOLDER']}/{doc.stored_name}", encoding="utf-8").read()  # original upload remains unchanged
+
+
+
+def _prepare_manual_correction_document(client, app):
+    """Create a document with predictable extracted fields for correction tests."""
+    response = client.post("/products/new", data={
+        "name": "Correction Test Product",
+        "brand": "Acer",
+        "retailer": "Wrong Store",
+    }, follow_redirects=True)
+    assert response.status_code == 200
+
+    response = client.post("/products/1/documents", data={
+        "document_type": "Invoice",
+        "document": (BytesIO(b"Sample correction test invoice"), "correction-test.txt"),
+    }, content_type="multipart/form-data", follow_redirects=True)
+    assert response.status_code == 200
+
+    with app.app_context():
+        doc = Document.query.order_by(Document.id.desc()).first()
+        assert doc is not None
+
+        doc.extracted_data = {
+            "fields": {
+                "brand": "Acer",
+                "retailer": "Wrong Store",
+                "purchase_date": "2026-04-10",
+                "purchase_price": "100.0",
+            },
+            "field_confidences": {},
+        }
+        db.session.commit()
+        return doc.id
+
+
+def test_manual_correction_rejects_invalid_purchase_date(logged_in_client, app):
+    document_id = _prepare_manual_correction_document(logged_in_client, app)
+
+    response = logged_in_client.post(
+        f"/documents/{document_id}/correct",
+        data={"purchase_date": "31/02/2026"},
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert b"valid purchase date" in response.data.lower()
+
+    with app.app_context():
+        doc = db.session.get(Document, document_id)
+        assert doc.extracted_data["fields"]["purchase_date"] == "2026-04-10"
+
+
+def test_manual_correction_rejects_negative_purchase_price(logged_in_client, app):
+    document_id = _prepare_manual_correction_document(logged_in_client, app)
+
+    response = logged_in_client.post(
+        f"/documents/{document_id}/correct",
+        data={"purchase_price": "-500"},
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert b"valid non-negative purchase price" in response.data.lower()
+
+    with app.app_context():
+        doc = db.session.get(Document, document_id)
+        assert doc.extracted_data["fields"]["purchase_price"] == "100.0"
+
+
+def test_manual_correction_rejects_oversized_text(logged_in_client, app):
+    document_id = _prepare_manual_correction_document(logged_in_client, app)
+
+    response = logged_in_client.post(
+        f"/documents/{document_id}/correct",
+        data={"brand": "A" * 121},
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert b"cannot exceed 120 characters" in response.data
+
+    with app.app_context():
+        doc = db.session.get(Document, document_id)
+        assert doc.extracted_data["fields"]["brand"] == "Acer"
+
+
+def test_manual_correction_accepts_and_normalizes_date_and_price(logged_in_client, app):
+    document_id = _prepare_manual_correction_document(logged_in_client, app)
+
+    response = logged_in_client.post(
+        f"/documents/{document_id}/correct",
+        data={
+            "purchase_date": "11/04/2026",
+            "purchase_price": "54990.50",
+        },
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+
+    with app.app_context():
+        doc = db.session.get(Document, document_id)
+        fields = doc.extracted_data["fields"]
+
+        assert fields["purchase_date"] == "2026-04-11"
+        assert fields["purchase_price"] == "54990.5"
+        assert "purchase_date" in doc.extracted_data["manual_corrections"]
+        assert "purchase_price" in doc.extracted_data["manual_corrections"]
+
+
+def test_manual_correction_rejects_all_changes_if_one_field_is_invalid(logged_in_client, app):
+    document_id = _prepare_manual_correction_document(logged_in_client, app)
+
+    response = logged_in_client.post(
+        f"/documents/{document_id}/correct",
+        data={
+            "retailer": "Correct Store",
+            "purchase_date": "not-a-date",
+        },
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert b"valid purchase date" in response.data.lower()
+
+    with app.app_context():
+        doc = db.session.get(Document, document_id)
+        fields = doc.extracted_data["fields"]
+
+        assert fields["retailer"] == "Wrong Store"
+        assert fields["purchase_date"] == "2026-04-10"
+        assert "manual_corrections" not in doc.extracted_data
 
 
 def _add_product_and_claim(app, *, expiry=None):
@@ -141,12 +331,71 @@ def test_claim_email_failure_does_not_mark_submitted(logged_in_client, app, monk
         "manufacturer_email": "support@example.com",
     }, follow_redirects=True)
     assert response.status_code == 200
-    assert b"SMTP unavailable" in response.data
+    assert b"service error" in response.data
+    assert b"SMTP unavailable" not in response.data
     with app.app_context():
         claim = db.session.get(Claim, claim_id)
         assert claim.status == "Draft"
         assert claim.submitted_at is None
         assert "SMTP unavailable" in claim.submission_error
+
+def test_claim_submission_rejects_missing_claim_attachment(logged_in_client, app):
+    from app.models import Claim
+
+    _product_id, claim_id, _user_id = _add_product_and_claim(app)
+
+    app.config.update({
+        "MAIL_SERVER": "smtp.example.test",
+        "MAIL_PORT": 587,
+        "MAIL_USERNAME": "sender@example.test",
+        "MAIL_PASSWORD": "secret",
+        "MAIL_DEFAULT_SENDER": "sender@example.test",
+    })
+
+    with app.app_context():
+        claim = db.session.get(Claim, claim_id)
+        claim.attachment_path = "missing-evidence.pdf"
+        claim.attachment_name = "missing-evidence.pdf"
+        db.session.commit()
+
+    response = logged_in_client.post(
+        f"/claims/{claim_id}/submit",
+        data={"manufacturer_email": "support@example.com"},
+        follow_redirects=True,
+    )
+
+    assert response.status_code == 200
+    assert b"missing or cannot be read" in response.data
+
+    with app.app_context():
+        claim = db.session.get(Claim, claim_id)
+        assert claim.status == "Draft"
+        assert claim.submitted_at is None
+
+
+def test_mailer_rejects_missing_attachment(tmp_path):
+    from app.services.mailer import send_email
+
+    missing_file = tmp_path / "missing-evidence.pdf"
+
+    config = {
+        "MAIL_SERVER": "smtp.example.test",
+        "MAIL_PORT": 587,
+        "MAIL_USERNAME": "sender@example.test",
+        "MAIL_PASSWORD": "secret",
+        "MAIL_DEFAULT_SENDER": "sender@example.test",
+    }
+
+    import pytest
+
+    with pytest.raises(FileNotFoundError, match="missing-evidence.pdf"):
+        send_email(
+            config,
+            recipient="support@example.com",
+            subject="Warranty claim",
+            body="Please review the attached evidence.",
+            attachments=[(str(missing_file), "missing-evidence.pdf")],
+        )
 
 
 def test_scheduled_reminders_create_once_and_send_only_when_opted_in(app, monkeypatch):
@@ -1089,3 +1338,22 @@ def test_autofill_rejects_changed_product_after_review(logged_in_client, app):
         assert AuditLog.query.filter_by(
             action="invoice_autofill_applied"
         ).count() == 0
+
+def test_upload_rejects_files_over_16_mb(logged_in_client, app):
+    logged_in_client.post("/products/new", data={
+        "name": "Test Laptop",
+        "brand": "Acer",
+    }, follow_redirects=True)
+
+    oversized_file = b"x" * (16 * 1024 * 1024 + 1)
+
+    response = logged_in_client.post("/products/1/documents", data={
+        "document_type": "Invoice",
+        "document": (BytesIO(oversized_file), "large-invoice.txt"),
+    }, content_type="multipart/form-data", follow_redirects=True)
+
+    assert response.status_code == 200
+    assert b"16 MB upload limit" in response.data
+
+    with app.app_context():
+        assert Document.query.count() == 0

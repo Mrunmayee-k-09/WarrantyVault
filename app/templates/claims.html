@@ -61,7 +61,13 @@
 </button>
 
       </form>
-      {% if claim.submission_error %}<div class="claim-error-note"><b>Last send attempt failed:</b> {{ claim.submission_error }}</div>{% endif %}
+      {% if claim.submission_error %}
+    <div class="claim-error-note">
+        <b>Last send attempt failed:</b>
+        The email could not be sent due to a service error.
+        Please try again later or contact the administrator.
+    </div>
+{% endif %}
     {% elif claim.status in ['Draft', 'Rejected'] %}
       <div class="claim-submit-disabled">Configure SMTP in your <code>.env</code> file to send this claim by email.</div>
     {% else %}

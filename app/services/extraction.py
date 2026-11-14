@@ -62,54 +62,130 @@ def _ocr_image(image):
     return pytesseract.image_to_string(image), notes, confidence
 
 
+
 def _ocr_pdf_pages(path: Path, text_pages: list[str]) -> tuple[str, list[str], float | None]:
-    """OCR only pages that have no selectable text, preserving text-based pages."""
+    """OCR scanned and image-containing PDF pages while preserving extracted text."""
     try:
-        import fitz  # PyMuPDF; bundled wheel, no Poppler installation required
+        import fitz  # PyMuPDF
         from PIL import Image
-        import pytesseract  # check the wrapper separately for a clearer message
+        import pytesseract
     except ImportError as exc:
         missing = "PyMuPDF" if "fitz" in str(exc) else "Pillow/pytesseract"
-        return "\n".join(text_pages), [
-            f"This PDF appears to contain scanned pages. Install {missing} from requirements.txt and install the Tesseract OCR application to read those pages."
+        return "\n\n".join(text_pages), [
+            f"PDF image/scanned-page OCR dependencies are missing. Install {missing} from requirements.txt and install the Tesseract OCR application."
         ], None
 
     _configure_tesseract(pytesseract)
+
     notes = []
     confidence_scores = []
     parts = list(text_pages)
+
+    def merge_page_text(existing: str, recognized: str) -> str:
+        """Append OCR lines without repeating exact existing lines."""
+        existing_lines = existing.splitlines()
+        seen = {
+            " ".join(line.split()).casefold()
+            for line in existing_lines
+            if line.strip()
+        }
+
+        new_lines = []
+        for line in recognized.splitlines():
+            normalized = " ".join(line.split()).casefold()
+
+            if normalized and normalized not in seen:
+                new_lines.append(line)
+                seen.add(normalized)
+
+        return "\n".join(existing_lines + new_lines).strip()
+
     try:
-        pdf = fitz.open(str(path))
-        if not text_pages:
-            text_pages = [""] * len(pdf)
-        elif len(text_pages) < len(pdf):
-            text_pages.extend([""] * (len(pdf) - len(text_pages)))
-        scan_indices = [i for i, page_text in enumerate(text_pages) if not page_text.strip()]
-        if len(scan_indices) > PDF_OCR_MAX_PAGES:
-            notes.append(f"The PDF has {len(scan_indices)} scanned pages. Only the first {PDF_OCR_MAX_PAGES} scanned pages were OCR-processed in this pass.")
-            scan_indices = scan_indices[:PDF_OCR_MAX_PAGES]
-        for page_index in scan_indices:
-            page = pdf.load_page(page_index)
-            pixmap = page.get_pixmap(matrix=fitz.Matrix(2.2, 2.2), alpha=False)
-            image = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
-            page_text, page_notes, score = _ocr_image(image)
-            if page_text.strip():
-                parts[page_index] = page_text
-            notes.extend(f"Page {page_index + 1}: {item}" for item in page_notes)
-            if score is not None:
-                confidence_scores.append(score)
-        pdf.close()
-        combined = "\n\n".join(part for part in parts if part.strip())
+        with fitz.open(str(path)) as pdf:
+            if len(parts) < len(pdf):
+                parts.extend([""] * (len(pdf) - len(parts)))
+
+            # OCR pages that are scanned OR contain embedded images.
+            ocr_indices = []
+
+            for page_index in range(len(pdf)):
+                page = pdf.load_page(page_index)
+
+                has_no_text = not parts[page_index].strip()
+                has_images = bool(page.get_images(full=True))
+
+                if has_no_text or has_images:
+                    ocr_indices.append(page_index)
+
+            if len(ocr_indices) > PDF_OCR_MAX_PAGES:
+                notes.append(
+                    f"The PDF has {len(ocr_indices)} pages requiring OCR. "
+                    f"Only the first {PDF_OCR_MAX_PAGES} pages were OCR-processed in this pass."
+                )
+                ocr_indices = ocr_indices[:PDF_OCR_MAX_PAGES]
+
+            for page_index in ocr_indices:
+                page = pdf.load_page(page_index)
+
+                pixmap = page.get_pixmap(
+                    matrix=fitz.Matrix(2.2, 2.2),
+                    alpha=False
+                )
+
+                image = Image.frombytes(
+                    "RGB",
+                    [pixmap.width, pixmap.height],
+                    pixmap.samples
+                )
+
+                page_text, page_notes, score = _ocr_image(image)
+
+                if page_text.strip():
+                    parts[page_index] = merge_page_text(
+                        parts[page_index],
+                        page_text
+                    )
+
+                notes.extend(
+                    f"Page {page_index + 1}: {item}"
+                    for item in page_notes
+                )
+
+                if score is not None:
+                    confidence_scores.append(score)
+
+        combined = "\n\n".join(
+            part for part in parts if part.strip()
+        )
+
         if not combined.strip():
-            notes.append("No readable text was found in the scanned PDF. Try a sharper, correctly oriented scan.")
-        return combined, notes, (sum(confidence_scores) / len(confidence_scores) if confidence_scores else None)
+            notes.append(
+                "No readable text was found in the scanned PDF. "
+                "Try a sharper, correctly oriented scan."
+            )
+
+        average_score = (
+            sum(confidence_scores) / len(confidence_scores)
+            if confidence_scores else None
+        )
+
+        return combined, notes, average_score
+
     except Exception as exc:
         message = str(exc)
+
         if "tesseract" in message.lower() or "not found" in message.lower():
-            notes.append("Tesseract OCR could not be started. Install the Tesseract application and set TESSERACT_CMD or add it to PATH.")
+            notes.append(
+                "Tesseract OCR could not be started. Install the Tesseract "
+                "application and set TESSERACT_CMD or add it to PATH."
+            )
         else:
             notes.append(f"Scanned-PDF OCR failed: {exc}")
-        return "\n\n".join(part for part in text_pages if part.strip()), notes, None
+
+        return "\n\n".join(
+            part for part in parts if part.strip()
+        ), notes, None
+
 
 
 def extract_text(path: str, extension: str) -> tuple[str, list[str], float | None]:
@@ -118,25 +194,44 @@ def extract_text(path: str, extension: str) -> tuple[str, list[str], float | Non
     ext = extension.lower().lstrip(".")
     if ext == "txt":
         return path.read_text(encoding="utf-8", errors="replace"), notes, None
+    
     if ext == "pdf":
         try:
             from pypdf import PdfReader
+
             reader = PdfReader(str(path))
             text_pages = [(page.extract_text() or "") for page in reader.pages]
-            if any(not page_text.strip() for page_text in text_pages):
+
+            # Also inspect pages containing embedded images.
+            has_images = any(
+                len(getattr(page, "images", [])) > 0
+                for page in reader.pages
+            )
+
+            if has_images or any(not page.strip() for page in text_pages):
                 text, ocr_notes, score = _ocr_pdf_pages(path, text_pages)
                 notes.extend(ocr_notes)
+
                 if score is not None:
-                    notes.append("Scanned PDF pages were OCR-processed. OCR confidence describes text-recognition certainty, not document authenticity.")
+                    notes.append(
+                        "Scanned PDF pages were OCR-processed. OCR confidence "
+                        "describes text-recognition certainty, not document authenticity."
+                    )
+
                 return text, notes, score
+
             return "\n\n".join(text_pages), notes, None
+
         except Exception as exc:
-            # If pypdf cannot parse the file, attempt a raster/OCR pass as a fallback.
+            # If pypdf cannot parse the file, attempt a raster/OCR pass.
             text, ocr_notes, score = _ocr_pdf_pages(path, [])
             notes.extend(ocr_notes)
+
             if not text.strip():
                 notes.append(f"PDF text extraction failed: {exc}")
+
             return text, notes, score
+
     if ext == "docx":
         try:
             from docx import Document as DocxDocument

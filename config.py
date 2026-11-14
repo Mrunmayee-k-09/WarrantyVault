@@ -5,12 +5,29 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 
 
+
 class Config:
     CLAIM_SUBMISSION_MODE = os.getenv("CLAIM_SUBMISSION_MODE", "smtp").lower()
+    SESSION_COOKIE_SECURE = os.getenv(
+        "SESSION_COOKIE_SECURE", "false"
+        ).lower() in {"1", "true", "yes"}
+    
+    REMEMBER_COOKIE_SECURE = os.getenv(
+        "REMEMBER_COOKIE_SECURE", "false"
+        ).lower() in {"1", "true", "yes"}
+    
     CLAIM_SIMULATION_ALLOWED = os.getenv(
     "CLAIM_SIMULATION_ALLOWED", "false"
     ).lower() in {"1", "true", "yes"}
-    SECRET_KEY = os.getenv("SECRET_KEY", "dev-only-change-this-secret-key")
+    SECRET_KEY = os.getenv("SECRET_KEY")
+
+    if not SECRET_KEY:
+        if os.getenv("FLASK_ENV") == "production":
+            raise RuntimeError(
+            "SECRET_KEY must be set in production."
+        )
+
+    SECRET_KEY = "local-development-only-change-before-deployment"
     SQLALCHEMY_DATABASE_URI = os.getenv("DATABASE_URL", f"sqlite:///{BASE_DIR / 'instance' / 'warrantyvault.db'}")
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16 MB

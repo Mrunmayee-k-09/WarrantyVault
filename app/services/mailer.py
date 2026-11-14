@@ -43,9 +43,18 @@ def send_email(config, *, recipient: str, subject: str, body: str,
     total_bytes = 0
     for file_path, display_name in attachments or []:
         path = Path(file_path)
+
         if not path.is_file():
-            continue
-        payload = path.read_bytes()
+            raise FileNotFoundError(
+                f"Selected evidence attachment is missing: {display_name}"
+            )
+
+        try:
+            payload = path.read_bytes()
+        except OSError as exc:
+            raise OSError(
+                f"Could not read evidence attachment: {display_name}"
+            ) from exc
         total_bytes += len(payload)
         if total_bytes > 10 * 1024 * 1024:
             raise ValueError("Email attachments exceed the 10 MB combined limit. Remove a file and try again.")

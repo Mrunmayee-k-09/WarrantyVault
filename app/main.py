@@ -173,17 +173,54 @@ def _parse_float(value):
 
 
 
+
 def _save_upload(file_storage):
     if not file_storage or not file_storage.filename:
         return None, None
+
     original = secure_filename(file_storage.filename)
     ext = Path(original).suffix.lower().lstrip(".")
-    if ext not in current_app.config["ALLOWED_EXTENSIONS"]:
-        raise ValueError("Unsupported file type. Use PDF, PNG, JPG, TIFF, TXT, or DOCX.")
+
+    allowed_extensions = current_app.config["ALLOWED_EXTENSIONS"]
+
+    if ext not in allowed_extensions:
+        raise ValueError(
+            "Unsupported file type. Use PDF, PNG, JPG, TIFF, TXT, or DOCX."
+        )
+
+    # Read the file once and reject empty uploads.
+    content = file_storage.read()
+    file_storage.seek(0)
+
+    if not content:
+        raise ValueError("The uploaded file is empty.")
+
+    # Validate common file signatures.
+    signatures = {
+        "pdf": lambda data: data.startswith(b"%PDF-"),
+        "png": lambda data: data.startswith(b"\x89PNG\r\n\x1a\n"),
+        "jpg": lambda data: data.startswith(b"\xff\xd8\xff"),
+        "jpeg": lambda data: data.startswith(b"\xff\xd8\xff"),
+        "tif": lambda data: data.startswith((b"II*\x00", b"MM\x00*")),
+        "tiff": lambda data: data.startswith((b"II*\x00", b"MM\x00*")),
+        "docx": lambda data: data.startswith(b"PK\x03\x04"),
+    }
+
+    if ext in signatures and not signatures[ext](content):
+        raise ValueError(
+            "The uploaded file does not appear to match its file extension."
+        )
+
     stored = f"{uuid.uuid4().hex}.{ext}"
     destination = Path(current_app.config["UPLOAD_FOLDER"]) / stored
-    file_storage.save(destination)
-    return original, stored
+
+    try:
+        file_storage.save(destination)
+        return original, stored
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+
 
 
 def _process_doc(doc):
@@ -364,30 +401,99 @@ def delete_product(product_id):
 
 @main_bp.post("/products/<int:product_id>/documents")
 @login_required
+
 def upload_document(product_id):
     product = _owned_product(product_id)
     file = request.files.get("document")
+
+    stored = None
+
     try:
         original, stored = _save_upload(file)
+
         if not original:
             flash("Choose a document to upload.", "error")
-            return redirect(url_for("main.product_detail", product_id=product.id))
+            return redirect(url_for(
+                "main.product_detail",
+                product_id=product.id
+            ))
+
         path = Path(current_app.config["UPLOAD_FOLDER"]) / stored
-        doc = Document(product_id=product.id, original_name=original, stored_name=stored,
-                       file_type=path.suffix.lstrip("."), document_type=request.form.get("document_type", "Invoice"),
-                       status="Uploaded", file_size=path.stat().st_size)
+
+        doc = Document(
+            product_id=product.id,
+            original_name=original,
+            stored_name=stored,
+            file_type=path.suffix.lstrip("."),
+            document_type=request.form.get("document_type", "Invoice"),
+            status="Uploaded",
+            file_size=path.stat().st_size
+        )
+
         db.session.add(doc)
         db.session.flush()
-        _audit("document", doc.id, "document_uploaded", {"filename": original})
+
+        _audit("document", doc.id, "document_uploaded", {
+            "filename": original
+        })
+
         db.session.commit()
-        _process_doc(doc)
-        if doc.status == "Processing failed":
-            flash("The file was saved, but readable invoice fields could not be extracted. You can review it or retry after fixing the document/OCR setup.", "warning")
-        else:
-            flash("Document uploaded and processed. Review the extracted fields before verification.", "success")
+
     except ValueError as exc:
+        db.session.rollback()
+
+        if stored:
+            (Path(current_app.config["UPLOAD_FOLDER"]) / stored).unlink(
+                missing_ok=True
+            )
+
         flash(str(exc), "error")
-    return redirect(url_for("main.product_detail", product_id=product.id))
+        return redirect(url_for(
+            "main.product_detail",
+            product_id=product.id
+        ))
+
+    except Exception:
+        db.session.rollback()
+
+        if stored:
+            try:
+                (Path(current_app.config["UPLOAD_FOLDER"]) / stored).unlink(
+                    missing_ok=True
+                )
+            except OSError:
+                current_app.logger.exception(
+                    "Could not clean up failed document upload."
+                )
+
+        current_app.logger.exception("Document upload failed.")
+        flash("Document upload failed. Please try again.", "error")
+        return redirect(url_for(
+            "main.product_detail",
+            product_id=product.id
+        ))
+
+    _process_doc(doc)
+
+    if doc.status == "Processing failed":
+        flash(
+            "The file was saved, but readable invoice fields could not be "
+            "extracted. You can review it or retry after fixing the "
+            "document/OCR setup.",
+            "warning"
+        )
+    else:
+        flash(
+            "Document uploaded and processed. Review the extracted fields "
+            "before verification.",
+            "success"
+        )
+
+    return redirect(url_for(
+        "main.product_detail",
+        product_id=product.id
+    ))
+
 
 
 @main_bp.get("/documents")
@@ -733,59 +839,187 @@ def verification_report(verification_id):
     return render_template("verification_report.html", verification=verification)
 
 
+
 @main_bp.post("/documents/<int:document_id>/correct")
 @login_required
 def correct_extraction(document_id):
     doc = _owned_document(document_id)
-    fields = (doc.extracted_data or {}).get("fields", {}).copy()
-    confs = (doc.extracted_data or {}).get("field_confidences", {}).copy()
-    allowed = {"brand", "retailer", "model_number", "serial_number", "purchase_date", "invoice_number", "purchase_price"}
+
+    payload = dict(doc.extracted_data or {})
+    fields = dict(payload.get("fields") or {})
+    confs = dict(payload.get("field_confidences") or {})
+
+    allowed = {
+        "brand": 120,
+        "retailer": 180,
+        "model_number": 140,
+        "serial_number": 140,
+        "purchase_date": None,
+        "invoice_number": 100,
+        "purchase_price": None,
+    }
+
     changes = {}
-    for key in allowed:
-        if key in request.form:
-            value = request.form.get(key, "").strip()
-            old = fields.get(key)
-            if value != (old or ""):
-                changes[key] = {"from": old, "to": value}
-                if value:
-                    fields[key] = value
-                else:
-                    fields.pop(key, None)
-                    confs.pop(key, None)
-    payload = doc.extracted_data or {}
+    corrections = {}
+
+    for key, max_length in allowed.items():
+        if key not in request.form:
+            continue
+
+        value = request.form.get(key, "").strip()
+        normalized_value = value
+
+        # Validate text field lengths.
+        if max_length is not None and len(value) > max_length:
+            flash(
+                f"{key.replace('_', ' ').title()} cannot exceed "
+                f"{max_length} characters.",
+                "error",
+            )
+            return redirect(url_for(
+                "main.document_report",
+                document_id=doc.id,
+            ))
+
+        # Validate and normalize dates.
+        if key == "purchase_date" and value:
+            parsed_date = _parse_date(value)
+
+            if parsed_date is None:
+                flash("Please enter a valid purchase date.", "error")
+                return redirect(url_for(
+                    "main.document_report",
+                    document_id=doc.id,
+                ))
+
+            normalized_value = parsed_date.isoformat()
+
+        # Validate and normalize purchase prices.
+        elif key == "purchase_price" and value:
+            parsed_price = _parse_float(value)
+
+            if parsed_price is None:
+                flash("Please enter a valid non-negative purchase price.", "error")
+                return redirect(url_for(
+                    "main.document_report",
+                    document_id=doc.id,
+                ))
+
+            normalized_value = str(parsed_price)
+
+        old_value = fields.get(key)
+
+        if normalized_value != (old_value or ""):
+            changes[key] = {
+                "from": old_value,
+                "to": normalized_value,
+            }
+
+            if normalized_value:
+                fields[key] = normalized_value
+            else:
+                fields.pop(key, None)
+                confs.pop(key, None)
+
+    # Nothing changed: avoid unnecessary database writes.
+    if not changes:
+        flash("No changes were made.", "info")
+        return redirect(url_for(
+            "main.document_report",
+            document_id=doc.id,
+        ))
+
+    # Record manual correction history.
+    manual = dict(payload.get("manual_corrections") or {})
+
+    timestamp = datetime.now(timezone.utc).replace(
+        tzinfo=None
+    ).isoformat()
+
+    for key, change in changes.items():
+        manual[key] = {
+            "from": change["from"],
+            "to": change["to"],
+            "updated_at": timestamp,
+        }
+
     payload["fields"] = fields
     payload["field_confidences"] = confs
-    manual = payload.get("manual_corrections", {}).copy()
-    for key, change in changes.items():
-        manual[key] = {"from": change["from"], "to": change["to"], "updated_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat()}
     payload["manual_corrections"] = manual
+
     doc.extracted_data = payload
-    try:
-        from sqlalchemy.orm.attributes import flag_modified as _flag_modified
-        _flag_modified(doc, "extracted_data")
-    except Exception:
-        pass
-    _audit("document", doc.id, "extraction_corrected", {"changes": changes, "manual_review": True})
+
+    _audit(
+        "document",
+        doc.id,
+        "extraction_corrected",
+        {
+            "changes": changes,
+            "manual_review": True,
+        },
+    )
+
     db.session.commit()
-    flash("Corrections saved. The original uploaded file remains unchanged. Run verification again to create a new history entry.", "success")
-    return redirect(url_for("main.document_report", document_id=doc.id))
+
+    flash(
+        "Corrections saved. The original uploaded file remains unchanged. "
+        "Run verification again to create a new history entry.",
+        "success",
+    )
+
+    return redirect(url_for(
+        "main.document_report",
+        document_id=doc.id,
+    ))
+
 
 
 @main_bp.post("/documents/<int:document_id>/delete")
 @login_required
+
 def delete_document(document_id):
     doc = _owned_document(document_id)
     product_id = doc.product_id
-    _audit("document", doc.id, "document_deleted", {"filename": doc.original_name})
     path = Path(current_app.config["UPLOAD_FOLDER"]) / doc.stored_name
+
+    _audit("document", doc.id, "document_deleted", {
+        "filename": doc.original_name
+    })
+
     db.session.delete(doc)
-    db.session.commit()
+
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception("Document deletion failed.")
+        flash("Could not delete the document. Please try again.", "error")
+        return redirect(url_for(
+            "main.product_detail",
+            product_id=product_id
+        ))
+
     try:
         path.unlink(missing_ok=True)
     except OSError:
-        pass
+        current_app.logger.exception(
+            "Document record deleted, but its physical file could not be removed."
+        )
+        flash(
+            "Document record deleted, but its stored file could not be removed.",
+            "warning"
+        )
+        return redirect(url_for(
+            "main.product_detail",
+            product_id=product_id
+        ))
+
     flash("Document and its verification history deleted.", "info")
-    return redirect(url_for("main.product_detail", product_id=product_id))
+    return redirect(url_for(
+        "main.product_detail",
+        product_id=product_id
+    ))
+
 
 
 
@@ -928,11 +1162,23 @@ def submit_claim_email(claim_id):
 
         evidence_path = upload_root / evidence_document.stored_name
 
-        if evidence_path.exists():
-            attachments.append((
-                str(evidence_path),
-                evidence_document.original_name,
-            ))
+        attachments.append((
+            str(evidence_path),
+            evidence_document.original_name,
+        ))
+
+    # Validate every selected evidence file before SMTP or simulation.
+    for file_path, display_name in attachments:
+        try:
+            with open(file_path, "rb") as attachment_file:
+                attachment_file.read(1)
+        except OSError:
+            flash(
+                f"The selected evidence file '{display_name}' is missing "
+                "or cannot be read. Please upload it again before submitting.",
+                "error",
+            )
+            return redirect(url_for("main.claims"))
 
     product = claim.product
 
@@ -990,7 +1236,11 @@ def submit_claim_email(claim_id):
 
             db.session.commit()
 
-            flash(f"The claim email was not sent: {exc}", "error")
+            flash(
+    "The claim email could not be sent due to an email service error. "
+    "Please try again later or contact the administrator.",
+    "error",
+)
             return redirect(url_for("main.claims"))
 
         submission_channel = "Email"
@@ -1020,10 +1270,11 @@ def submit_claim_email(claim_id):
 
     if submission_mode == "simulation":
         flash(
-            "SIMULATED SUBMISSION: Your claim was marked as submitted. "
-            "No email was sent.",
-            "success",
-        )
+    "The claim email could not be sent due to an email service error. "
+    "Please try again later or contact the administrator.",
+    "error",
+)
+        
     else:
         flash(
             "Claim email accepted by your SMTP server. "
@@ -1123,15 +1374,54 @@ def export_json():
 
 @main_bp.get("/export/products.csv")
 @login_required
+
 def export_csv():
-    products = Product.query.filter_by(user_id=current_user.id).order_by(Product.name).all()
+    products = Product.query.filter_by(
+        user_id=current_user.id
+    ).order_by(Product.name).all()
+
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Product", "Brand", "Category", "Serial number", "Model number", "Retailer", "Purchase date", "Purchase price", "Warranty start", "Warranty expiry", "Warranty status"])
+
+    def safe_csv_value(value):
+        if value is None:
+            return ""
+
+        value = str(value)
+
+        # Prevent spreadsheet formula injection.
+        if value.lstrip().startswith(("=", "+", "-", "@", "\t", "\r")):
+            return "'" + value
+
+        return value
+
+    writer.writerow([
+        "Product", "Brand", "Category", "Serial number",
+        "Model number", "Retailer", "Purchase date",
+        "Purchase price", "Warranty start", "Warranty expiry",
+        "Warranty status"
+    ])
+
     for p in products:
-        writer.writerow([p.name, p.brand, p.category, p.serial_number, p.model_number, p.retailer,
-            p.purchase_date, p.purchase_price, p.warranty_start, p.warranty_expiry, p.warranty_status])
+        writer.writerow([
+            safe_csv_value(p.name),
+            safe_csv_value(p.brand),
+            safe_csv_value(p.category),
+            safe_csv_value(p.serial_number),
+            safe_csv_value(p.model_number),
+            safe_csv_value(p.retailer),
+            safe_csv_value(p.purchase_date),
+            safe_csv_value(p.purchase_price),
+            safe_csv_value(p.warranty_start),
+            safe_csv_value(p.warranty_expiry),
+            safe_csv_value(p.warranty_status)
+        ])
+
     response = make_response(output.getvalue())
     response.headers["Content-Type"] = "text/csv; charset=utf-8"
-    response.headers["Content-Disposition"] = "attachment; filename=warrantyvault-products.csv"
+    response.headers["Content-Disposition"] = (
+        "attachment; filename=warrantyvault-products.csv"
+    )
+
     return response
+
