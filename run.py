@@ -19,6 +19,9 @@ def init_db_command():
 @app.cli.command("seed-demo")
 def seed_demo_command():
     """Create a local demo account and example product records."""
+    if app.config.get("IS_PRODUCTION"):
+        raise RuntimeError("The seed-demo command is disabled in production.")
+
     email = "demo@warrantyvault.local"
     user = User.query.filter_by(email=email).first()
     if user:
@@ -58,4 +61,12 @@ def send_reminders_command():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=int(os.getenv("PORT", "5000")), debug=os.getenv("FLASK_DEBUG", "0") == "1")
+    if app.config.get("IS_PRODUCTION"):
+        from waitress import serve
+        serve(app, host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+    else:
+        app.run(
+            host="127.0.0.1",
+            port=int(os.getenv("PORT", "5000")),
+            debug=os.getenv("FLASK_DEBUG", "0") == "1"
+        )

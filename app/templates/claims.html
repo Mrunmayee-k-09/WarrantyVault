@@ -24,16 +24,10 @@
         <small class="claim-meta">Created {{ claim.created_at.strftime('%d %b %Y · %I:%M %p') }}{% if claim.attachment_name %} · <a class="text-link" href="{{ url_for('main.download_claim_attachment', claim_id=claim.id) }}">Evidence: {{ claim.attachment_name }}</a>{% endif %}</small>
       </div>
       <span class="status status-{{ claim.status|lower|replace(' ', '-') }}">{{ claim.status }}</span>
-    </div>
+    </div>{% if claim.submitted_at and claim.submission_channel != 'Simulation' %}
+  <div class="claim-submitted-details">
+    <b>Email accepted by SMTP for {{ claim.manufacturer_name or 'support' }}</b>
 
-    {% if claim.submitted_at %}
-      <div class="claim-submitted-details">
-      
-{% if claim.submission_channel == 'Simulation' %}
-    <b>Claim submission simulated</b>
-{% else %}
-    <b>Email sent to {{ claim.manufacturer_name or 'support' }}</b>
-{% endif %}
 
         <span>{{ claim.manufacturer_email }} · {{ claim.submitted_at.strftime('%d %b %Y · %I:%M %p') }}</span>
         <small>Submission channel: {{ claim.submission_channel or 'Email' }}. Track the actual response with the support provider.</small>

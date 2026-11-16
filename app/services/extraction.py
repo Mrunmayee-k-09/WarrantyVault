@@ -7,6 +7,8 @@ from pathlib import Path
 import os
 import re
 from datetime import datetime
+import pytesseract
+
 
 FIELD_PATTERNS = {
     "brand": [r"(?:brand|manufacturer)\s*[:#-]\s*([^\n,;]+)"],
@@ -31,8 +33,18 @@ def _normalize_date(value):
 
 def _configure_tesseract(pytesseract):
     configured_path = os.getenv("TESSERACT_CMD", "").strip()
+
     if configured_path:
         pytesseract.pytesseract.tesseract_cmd = configured_path
+        return
+
+    # Windows default installation location.
+    windows_default = Path(
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    )
+
+    if windows_default.is_file():
+        pytesseract.pytesseract.tesseract_cmd = str(windows_default)
 
 
 def _ocr_image(image):
@@ -255,40 +267,135 @@ def extract_text(path: str, extension: str) -> tuple[str, list[str], float | Non
     return "", ["Unsupported document type."], None
 
 
+
+
 def parse_invoice_fields(text: str, ocr_score: float | None = None) -> tuple[dict, dict, str]:
     extracted, confidences = {}, {}
+
     if not text.strip():
         return extracted, confidences, "LOW"
-    for field, patterns in FIELD_PATTERNS.items():
+
+    # Prefer a product Tax Invoice over shipping and service documents.
+    sections = re.split(r"Tax\s+Invoice", text, flags=re.IGNORECASE)
+
+    product_section = None
+
+    for section in sections[1:]:
+        has_serial = bool(
+            re.search(
+                r"(?:IMEI\s*/\s*)?Serial\s*(?:No|Number)\s*:",
+                section,
+                re.I
+            )
+        )
+        has_product = bool(
+            re.search(r"Warranty:|Gaming Laptop|Laptop|Product", section, re.I)
+        )
+        has_total = bool(
+            re.search(r"Grand\s+Total", section, re.I)
+        )
+
+        if has_serial and has_product and has_total:
+            product_section = section
+            break
+
+    source = product_section if product_section else text
+
+    def find(patterns, content=None, flags=re.IGNORECASE | re.MULTILINE):
+        if content is None:
+            content = source
+
         for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
+            match = re.search(pattern, content, flags)
             if match:
-                value = match.group(1).strip().strip(" .,:;")
-                if field == "purchase_date":
-                    value = _normalize_date(value)
-                elif field == "purchase_price":
-                    try:
-                        value = str(float(value.replace(",", "")))
-                    except ValueError:
-                        pass
-                extracted[field] = value
-                if ocr_score is None:
-                    confidences[field] = "HIGH"
-                elif ocr_score >= 80:
-                    confidences[field] = "HIGH"
-                elif ocr_score >= 50:
-                    confidences[field] = "MEDIUM"
-                else:
-                    confidences[field] = "LOW"
-                break
+                return match.group(1).strip().strip(" .,:;")
+
+        return None
+
+    fields = {
+        "retailer": find([
+            r"Sold\s+By\s*:\s*(.+?)(?:,|\n)",
+            r"(?:retailer|seller)\s*:\s*([^\n]+)"
+        ]),
+
+        # Invoice number can appear before the Tax Invoice heading.
+        "invoice_number": find([
+            r"Invoice\s+Number\s*#?\s*:?\s*([A-Z0-9/-]{5,})"
+        ], content=text),
+
+        # Some PDFs place the date immediately before the Invoice Date label.
+        "purchase_date": (
+            find([
+                r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*Invoice\s+Date"
+            ], content=text, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
+            or find([
+                r"Invoice\s+Date\s*:?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+                r"Purchase\s+Date\s*:?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+            ], content=source)
+        ),
+
+        # Allow line breaks and a closing bracket after the serial label.
+        "serial_number": find([
+            r"(?:IMEI\s*/\s*)?Serial\s*(?:No|Number)\s*:\s*\]?\s*([A-Z0-9-]{6,})",
+            r"S\s*/\s*N\s*:\s*([A-Z0-9-]{6,})"
+        ]),
+        "purchase_price": find([
+            r"Grand\s+Total\s*(?:₹|Rs\.?|INR)?\s*([0-9,]+(?:\.\d{1,2})?)"
+        ]),
+    }
+
+    # Infer brand from the product description.
+    brand_match = re.search(
+        r"\b(Acer|HP|Dell|Lenovo|ASUS|Apple|Samsung|LG|MSI|Sony|Toshiba)\b",
+        source,
+        re.IGNORECASE
+    )
+    if brand_match:
+        fields["brand"] = brand_match.group(1).title()
+
+    # Allow spaces around hyphens because PDF extraction may split model codes.
+    model_match = re.search(
+        r"\b([A-Z]{1,5}\d{1,4}(?:\s*-\s*[A-Z0-9]+){1,4})\b",
+        source,
+        re.IGNORECASE
+    )
+    if model_match:
+        fields["model_number"] = re.sub(r"\s+", "", model_match.group(1))
+
+    for field, value in fields.items():
+        if not value:
+            continue
+
+        if field == "purchase_date":
+            value = _normalize_date(value)
+
+        elif field == "purchase_price":
+            value = str(float(value.replace(",", "")))
+
+        extracted[field] = value
+
+        if ocr_score is None or ocr_score >= 80:
+            confidences[field] = "HIGH"
+        elif ocr_score >= 50:
+            confidences[field] = "MEDIUM"
+        else:
+            confidences[field] = "LOW"
+
     if not extracted:
         return extracted, confidences, "LOW"
+
     rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
-    mean_confidence = sum(rank[value] for value in confidences.values()) / len(confidences)
-    overall = "HIGH" if mean_confidence >= 2.6 else "MEDIUM" if mean_confidence >= 1.7 else "LOW"
+    mean_confidence = sum(
+        rank[value] for value in confidences.values()
+    ) / len(confidences)
+
+    overall = (
+        "HIGH" if mean_confidence >= 2.6
+        else "MEDIUM" if mean_confidence >= 1.7
+        else "LOW"
+    )
+
     return extracted, confidences, overall
-
-
 def process_document(path: str, extension: str) -> tuple[dict, dict, str, str, list[str]]:
     text, notes, ocr_score = extract_text(path, extension)
     data, confidences, overall = parse_invoice_fields(text, ocr_score)

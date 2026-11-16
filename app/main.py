@@ -226,12 +226,47 @@ def _save_upload(file_storage):
 def _process_doc(doc):
     doc.status = "Processing"
     db.session.commit()
+
     path = Path(current_app.config["UPLOAD_FOLDER"]) / doc.stored_name
-    data, confidence_map, overall, extracted_text, notes = process_document(str(path), doc.file_type)
-    doc.extracted_data = {"fields": data, "field_confidences": confidence_map, "text_preview": extracted_text}
-    doc.extraction_confidence = overall
-    doc.extraction_notes = "\n".join(notes)
-    doc.status = "Ready to verify" if data else "Processing failed"
+
+    try:
+        data, confidence_map, overall, extracted_text, notes = (
+            process_document(str(path), doc.file_type)
+        )
+
+        doc.extracted_data = {
+            "fields": data,
+            "field_confidences": confidence_map,
+            "text_preview": extracted_text,
+        }
+        doc.extraction_confidence = overall
+        doc.extraction_notes = "\n".join(notes)
+        doc.status = "Ready to verify" if data else "Processing failed"
+
+    except Exception as exc:
+        current_app.logger.exception(
+            "Document extraction failed for document %s",
+            doc.id,
+        )
+
+        db.session.rollback()
+
+        doc = db.session.get(Document, doc.id)
+
+        if doc is None:
+            raise
+
+        doc.extracted_data = {
+            "fields": {},
+            "field_confidences": {},
+            "text_preview": "",
+        }
+        doc.extraction_confidence = "LOW"
+        doc.extraction_notes = (
+            f"Unexpected document processing error: {exc}"
+        )
+        doc.status = "Processing failed"
+
     db.session.commit()
 
 
@@ -385,17 +420,59 @@ def edit_product(product_id):
 def delete_product(product_id):
     product = _owned_product(product_id)
     name = product.name
-    # Remove physical attachments as well as their cascading database records.
+
+    # Collect file paths first. Do not delete files before the DB commit.
+    files_to_delete = []
+
     for doc in product.documents:
-        (Path(current_app.config["UPLOAD_FOLDER"]) / doc.stored_name).unlink(missing_ok=True)
+        if doc.stored_name:
+            files_to_delete.append(
+                Path(current_app.config["UPLOAD_FOLDER"]) / doc.stored_name
+            )
+
     for claim in product.claims:
         if claim.attachment_path:
-            (Path(current_app.config["UPLOAD_FOLDER"]) / claim.attachment_path).unlink(missing_ok=True)
-    Notification.query.filter_by(user_id=current_user.id, product_id=product.id).delete(synchronize_session=False)
+            files_to_delete.append(
+                Path(current_app.config["UPLOAD_FOLDER"]) / claim.attachment_path
+            )
+
+    Notification.query.filter_by(
+        user_id=current_user.id,
+        product_id=product.id
+    ).delete(synchronize_session=False)
+
     _audit("product", product.id, "product_deleted", {"name": name})
     db.session.delete(product)
-    db.session.commit()
-    flash(f"{name} and its attached records were deleted.", "info")
+
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        current_app.logger.exception("Product deletion failed.")
+        flash("Could not delete the product. Please try again.", "error")
+        return redirect(url_for("main.products"))
+
+    # Only remove physical files after successful database deletion.
+    cleanup_failed = False
+
+    for path in files_to_delete:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            cleanup_failed = True
+            current_app.logger.exception(
+                "Could not remove an attachment after product deletion."
+            )
+
+    if cleanup_failed:
+        flash(
+            f"{name} was deleted, but some physical attachment files "
+            "could not be removed.",
+            "warning"
+        )
+    else:
+        flash(f"{name} and its attached records were deleted.", "info")
+
     return redirect(url_for("main.products"))
 
 
@@ -516,7 +593,7 @@ def documents():
 def download_document(document_id):
     doc = _owned_document(document_id)
     path = Path(current_app.config["UPLOAD_FOLDER"]) / doc.stored_name
-    if not path.exists():
+    if not path.is_file():
         abort(404)
     return send_file(path, as_attachment=True, download_name=doc.original_name)
 
@@ -526,8 +603,8 @@ def download_document(document_id):
 def retry_document(document_id):
     doc = _owned_document(document_id)
     path = Path(current_app.config["UPLOAD_FOLDER"]) / doc.stored_name
-    if not path.exists():
-        flash("The stored file is missing. Upload the document again.", "error")
+    if not path.is_file():
+        abort(404)
     else:
         _process_doc(doc)
         flash("Document processing retried.", "success" if doc.status != "Processing failed" else "warning")
@@ -1031,25 +1108,37 @@ def claims():
     ).order_by(desc(Claim.updated_at)).all()
 
     return render_template(
-        "claims.html",
-        claims=items,
-        submission_mode=current_app.config.get(
-            "CLAIM_SUBMISSION_MODE", "smtp"
-        ).strip().lower(),
-    )
+    "claims.html",
+    claims=items,
+    mail_ready=smtp_is_configured(current_app.config),
+    submission_mode=current_app.config.get(
+        "CLAIM_SUBMISSION_MODE", "smtp"
+    ).strip().lower(),
+)
 
 
 @main_bp.post("/products/<int:product_id>/claims")
 @login_required
 def create_claim(product_id):
     product = _owned_product(product_id)
+
     title = request.form.get("issue_title", "").strip()
     description = request.form.get("description", "").strip()
+
     if not title or not description:
         flash("Add a claim title and describe the issue.", "error")
         return redirect(url_for("main.product_detail", product_id=product.id))
-    claim = Claim(product_id=product.id, issue_title=title, description=description, status="Draft")
+
+    claim = Claim(
+        product_id=product.id,
+        issue_title=title,
+        description=description,
+        status="Draft"
+    )
+
     file = request.files.get("attachment")
+    stored = None
+
     if file and file.filename:
         try:
             original, stored = _save_upload(file)
@@ -1058,11 +1147,35 @@ def create_claim(product_id):
         except ValueError as exc:
             flash(str(exc), "error")
             return redirect(url_for("main.product_detail", product_id=product.id))
-    db.session.add(claim)
-    db.session.flush()
-    _audit("claim", claim.id, "claim_created", {"title": title})
-    db.session.commit()
-    flash("Claim draft created. Open Claims to email it to a manufacturer/support contact.", "success")
+
+    try:
+        db.session.add(claim)
+        db.session.flush()
+
+        _audit("claim", claim.id, "claim_created", {"title": title})
+        db.session.commit()
+
+    except Exception:
+        db.session.rollback()
+
+        if stored:
+            try:
+                (
+                    Path(current_app.config["UPLOAD_FOLDER"]) / stored
+                ).unlink(missing_ok=True)
+            except OSError:
+                current_app.logger.exception(
+                    "Could not clean up failed claim attachment upload."
+                )
+
+        current_app.logger.exception("Claim creation failed.")
+        flash("Could not create the claim. Please try again.", "error")
+        return redirect(url_for("main.product_detail", product_id=product.id))
+
+    flash(
+        "Claim draft created. Open Claims to email it to a manufacturer/support contact.",
+        "success"
+    )
     return redirect(url_for("main.claims"))
 
 
@@ -1073,7 +1186,7 @@ def download_claim_attachment(claim_id):
     if not claim.attachment_path:
         abort(404)
     path = Path(current_app.config["UPLOAD_FOLDER"]) / claim.attachment_path
-    if not path.exists():
+    if not path.is_file():
         abort(404)
     return send_file(path, as_attachment=True, download_name=claim.attachment_name or "claim-attachment")
 
@@ -1133,15 +1246,20 @@ def submit_claim_email(claim_id):
         )
         return redirect(url_for("main.claims"))
 
+        # Build the complete attachment list.
     attachments = []
     upload_root = Path(current_app.config["UPLOAD_FOLDER"])
 
+    # Include the claim's own evidence attachment, if present.
     if claim.attachment_path:
+        claim_attachment_path = upload_root / claim.attachment_path
+
         attachments.append((
-            str(upload_root / claim.attachment_path),
+            str(claim_attachment_path),
             claim.attachment_name or "claim-evidence",
         ))
 
+    # Include an optional invoice/document selected by the user.
     selected_document_id = request.form.get(
         "evidence_document_id", ""
     ).strip()
@@ -1167,7 +1285,7 @@ def submit_claim_email(claim_id):
             evidence_document.original_name,
         ))
 
-    # Validate every selected evidence file before SMTP or simulation.
+    # Validate every attachment before attempting submission.
     for file_path, display_name in attachments:
         try:
             with open(file_path, "rb") as attachment_file:
@@ -1248,33 +1366,36 @@ def submit_claim_email(claim_id):
 
     # Update the claim only after successful SMTP acceptance
     # or an explicitly permitted simulation.
+    previous = claim.status
+
     claim.manufacturer_name = manufacturer_name
     claim.manufacturer_email = manufacturer_email
     claim.submission_channel = submission_channel
-    claim.submitted_at = datetime.now(timezone.utc).replace(tzinfo=None)
     claim.submission_message_id = message_id
     claim.submission_error = None
 
-    previous = claim.status
-    claim.status = "Submitted"
+    if submission_mode == "simulation":
+        claim.status = "Draft"
+        claim.submitted_at = None
+    else:
+        claim.status = "Submitted"
+        claim.submitted_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
-    _audit("claim", claim.id, audit_action, {
-        "from": previous,
-        "to": "Submitted",
-        "recipient": manufacturer_email,
-        "message_id": message_id,
-        "attachments": [name for _path, name in attachments],
-    })
+        _audit("claim", claim.id, audit_action, {
+    "from": previous,
+    "to": claim.status,
+    "recipient": manufacturer_email,
+    "message_id": message_id,
+    "attachments": [name for _path, name in attachments],
+})
 
     db.session.commit()
 
     if submission_mode == "simulation":
         flash(
-    "The claim email could not be sent due to an email service error. "
-    "Please try again later or contact the administrator.",
-    "error",
-)
-        
+            "Simulation completed successfully. No email was sent.",
+            "success",
+        )
     else:
         flash(
             "Claim email accepted by your SMTP server. "

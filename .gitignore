@@ -39,3 +39,6 @@ Thumbs.db
 
 # Logs
 *.log
+# Local audit and SMTP diagnostic files
+WarrantyVault-audit.zip
+test_smtp.py

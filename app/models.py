@@ -141,8 +141,17 @@ class Claim(db.Model):
 
 class Notification(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
-    product_id = db.Column(db.Integer, db.ForeignKey("product.id"), nullable=True)
+    user_id = db.Column(
+        db.Integer,
+        db.ForeignKey("user.id"),
+        nullable=False,
+        index=True,
+    )
+    product_id = db.Column(
+        db.Integer,
+        db.ForeignKey("product.id"),
+        nullable=True,
+    )
     title = db.Column(db.String(180), nullable=False)
     message = db.Column(db.Text, nullable=False)
     category = db.Column(db.String(40), default="General")
@@ -151,6 +160,14 @@ class Notification(db.Model):
     email_sent_at = db.Column(db.DateTime)
     email_error = db.Column(db.Text)
     created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            "user_id",
+            "event_key",
+            name="uq_notification_user_event",
+        ),
+    )
 
 
 class AuditLog(db.Model):
