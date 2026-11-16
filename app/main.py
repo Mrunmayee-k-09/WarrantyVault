@@ -6,6 +6,7 @@ import os
 import uuid
 import re
 
+from contextlib import ExitStack
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from .models import (
     Claim, Notification, AuditLog
 )
 from .services.extraction import process_document
+from .services.storage import get_storage
 from .services.verification import build_verification
 from .services.mailer import smtp_is_configured, send_email
 from itsdangerous import (
@@ -176,7 +178,7 @@ def _parse_float(value):
 
 def _save_upload(file_storage):
     if not file_storage or not file_storage.filename:
-        return None, None
+        return None, None, 0
 
     original = secure_filename(file_storage.filename)
     ext = Path(original).suffix.lower().lstrip(".")
@@ -212,13 +214,19 @@ def _save_upload(file_storage):
         )
 
     stored = f"{uuid.uuid4().hex}.{ext}"
-    destination = Path(current_app.config["UPLOAD_FOLDER"]) / stored
 
     try:
-        file_storage.save(destination)
-        return original, stored
+        get_storage().save(
+            stored,
+            content,
+            content_type=file_storage.mimetype or "application/octet-stream",
+        )
+        return original, stored, len(content)
     except Exception:
-        destination.unlink(missing_ok=True)
+        try:
+            get_storage().delete(stored)
+        except Exception:
+            current_app.logger.exception("Could not clean up failed upload.")
         raise
 
 
@@ -227,12 +235,14 @@ def _process_doc(doc):
     doc.status = "Processing"
     db.session.commit()
 
-    path = Path(current_app.config["UPLOAD_FOLDER"]) / doc.stored_name
-
     try:
-        data, confidence_map, overall, extracted_text, notes = (
-            process_document(str(path), doc.file_type)
-        )
+        with get_storage().temporary_file(
+            doc.stored_name,
+            suffix=f".{doc.file_type}",
+        ) as temp_path:
+            data, confidence_map, overall, extracted_text, notes = (
+                process_document(str(temp_path), doc.file_type)
+            )
 
         doc.extracted_data = {
             "fields": data,
@@ -421,20 +431,16 @@ def delete_product(product_id):
     product = _owned_product(product_id)
     name = product.name
 
-    # Collect file paths first. Do not delete files before the DB commit.
+    # Collect storage keys first. Do not delete files before the DB commit.
     files_to_delete = []
 
     for doc in product.documents:
         if doc.stored_name:
-            files_to_delete.append(
-                Path(current_app.config["UPLOAD_FOLDER"]) / doc.stored_name
-            )
+            files_to_delete.append(doc.stored_name)
 
     for claim in product.claims:
         if claim.attachment_path:
-            files_to_delete.append(
-                Path(current_app.config["UPLOAD_FOLDER"]) / claim.attachment_path
-            )
+            files_to_delete.append(claim.attachment_path)
 
     Notification.query.filter_by(
         user_id=current_user.id,
@@ -452,13 +458,13 @@ def delete_product(product_id):
         flash("Could not delete the product. Please try again.", "error")
         return redirect(url_for("main.products"))
 
-    # Only remove physical files after successful database deletion.
+    # Only remove stored objects after successful database deletion.
     cleanup_failed = False
 
-    for path in files_to_delete:
+    for storage_key in files_to_delete:
         try:
-            path.unlink(missing_ok=True)
-        except OSError:
+            get_storage().delete(storage_key)
+        except Exception:
             cleanup_failed = True
             current_app.logger.exception(
                 "Could not remove an attachment after product deletion."
@@ -466,7 +472,7 @@ def delete_product(product_id):
 
     if cleanup_failed:
         flash(
-            f"{name} was deleted, but some physical attachment files "
+            f"{name} was deleted, but some stored attachment files "
             "could not be removed.",
             "warning"
         )
@@ -486,7 +492,7 @@ def upload_document(product_id):
     stored = None
 
     try:
-        original, stored = _save_upload(file)
+        original, stored, file_size = _save_upload(file)
 
         if not original:
             flash("Choose a document to upload.", "error")
@@ -495,16 +501,14 @@ def upload_document(product_id):
                 product_id=product.id
             ))
 
-        path = Path(current_app.config["UPLOAD_FOLDER"]) / stored
-
         doc = Document(
             product_id=product.id,
             original_name=original,
             stored_name=stored,
-            file_type=path.suffix.lstrip("."),
+            file_type=Path(original).suffix.lstrip("."),
             document_type=request.form.get("document_type", "Invoice"),
             status="Uploaded",
-            file_size=path.stat().st_size
+            file_size=file_size,
         )
 
         db.session.add(doc)
@@ -520,9 +524,12 @@ def upload_document(product_id):
         db.session.rollback()
 
         if stored:
-            (Path(current_app.config["UPLOAD_FOLDER"]) / stored).unlink(
-                missing_ok=True
-            )
+            try:
+                get_storage().delete(stored)
+            except Exception:
+                current_app.logger.exception(
+                    "Could not clean up failed document upload."
+                )
 
         flash(str(exc), "error")
         return redirect(url_for(
@@ -535,10 +542,8 @@ def upload_document(product_id):
 
         if stored:
             try:
-                (Path(current_app.config["UPLOAD_FOLDER"]) / stored).unlink(
-                    missing_ok=True
-                )
-            except OSError:
+                get_storage().delete(stored)
+            except Exception:
                 current_app.logger.exception(
                     "Could not clean up failed document upload."
                 )
@@ -592,18 +597,27 @@ def documents():
 @login_required
 def download_document(document_id):
     doc = _owned_document(document_id)
-    path = Path(current_app.config["UPLOAD_FOLDER"]) / doc.stored_name
-    if not path.is_file():
+    try:
+        content = get_storage().read(doc.stored_name)
+    except FileNotFoundError:
         abort(404)
-    return send_file(path, as_attachment=True, download_name=doc.original_name)
+    except Exception:
+        current_app.logger.exception("Document download failed for %s", doc.id)
+        abort(503)
+
+    return send_file(
+        io.BytesIO(content),
+        mimetype="application/octet-stream",
+        as_attachment=True,
+        download_name=doc.original_name,
+    )
 
 
 @main_bp.post("/documents/<int:document_id>/retry")
 @login_required
 def retry_document(document_id):
     doc = _owned_document(document_id)
-    path = Path(current_app.config["UPLOAD_FOLDER"]) / doc.stored_name
-    if not path.is_file():
+    if not get_storage().exists(doc.stored_name):
         abort(404)
     else:
         _process_doc(doc)
@@ -1057,7 +1071,7 @@ def correct_extraction(document_id):
 def delete_document(document_id):
     doc = _owned_document(document_id)
     product_id = doc.product_id
-    path = Path(current_app.config["UPLOAD_FOLDER"]) / doc.stored_name
+    stored_name = doc.stored_name
 
     _audit("document", doc.id, "document_deleted", {
         "filename": doc.original_name
@@ -1077,10 +1091,10 @@ def delete_document(document_id):
         ))
 
     try:
-        path.unlink(missing_ok=True)
-    except OSError:
+        get_storage().delete(stored_name)
+    except Exception:
         current_app.logger.exception(
-            "Document record deleted, but its physical file could not be removed."
+            "Document record deleted, but its stored object could not be removed."
         )
         flash(
             "Document record deleted, but its stored file could not be removed.",
@@ -1141,7 +1155,7 @@ def create_claim(product_id):
 
     if file and file.filename:
         try:
-            original, stored = _save_upload(file)
+            original, stored, _file_size = _save_upload(file)
             claim.attachment_name = original
             claim.attachment_path = stored
         except ValueError as exc:
@@ -1160,10 +1174,8 @@ def create_claim(product_id):
 
         if stored:
             try:
-                (
-                    Path(current_app.config["UPLOAD_FOLDER"]) / stored
-                ).unlink(missing_ok=True)
-            except OSError:
+                get_storage().delete(stored)
+            except Exception:
                 current_app.logger.exception(
                     "Could not clean up failed claim attachment upload."
                 )
@@ -1185,10 +1197,22 @@ def download_claim_attachment(claim_id):
     claim = _owned_claim(claim_id)
     if not claim.attachment_path:
         abort(404)
-    path = Path(current_app.config["UPLOAD_FOLDER"]) / claim.attachment_path
-    if not path.is_file():
+    try:
+        content = get_storage().read(claim.attachment_path)
+    except FileNotFoundError:
         abort(404)
-    return send_file(path, as_attachment=True, download_name=claim.attachment_name or "claim-attachment")
+    except Exception:
+        current_app.logger.exception(
+            "Claim attachment download failed for claim %s", claim.id
+        )
+        abort(503)
+
+    return send_file(
+        io.BytesIO(content),
+        mimetype="application/octet-stream",
+        as_attachment=True,
+        download_name=claim.attachment_name or "claim-attachment",
+    )
 
 
 
@@ -1246,166 +1270,179 @@ def submit_claim_email(claim_id):
         )
         return redirect(url_for("main.claims"))
 
-        # Build the complete attachment list.
-    attachments = []
-    upload_root = Path(current_app.config["UPLOAD_FOLDER"])
+    # Keep staged files alive until send_email has finished reading them.
+    with ExitStack() as attachment_stack:
+        attachments = []
+        storage = get_storage()
 
-    # Include the claim's own evidence attachment, if present.
-    if claim.attachment_path:
-        claim_attachment_path = upload_root / claim.attachment_path
+        # Collect the claim attachment key first.
+        # Missing files are handled by the validation below.
+        if claim.attachment_path:
+            attachments.append((
+                claim.attachment_path,
+                claim.attachment_name or "claim-evidence",
+                Path(claim.attachment_name or "claim-evidence").suffix,
+            ))
 
-        attachments.append((
-            str(claim_attachment_path),
-            claim.attachment_name or "claim-evidence",
-        ))
+        selected_document_id = request.form.get(
+            "evidence_document_id", ""
+        ).strip()
 
-    # Include an optional invoice/document selected by the user.
-    selected_document_id = request.form.get(
-        "evidence_document_id", ""
-    ).strip()
+        if selected_document_id:
+            try:
+                document_id = int(selected_document_id)
+            except ValueError:
+                abort(400)
 
-    if selected_document_id:
-        try:
-            document_id = int(selected_document_id)
-        except ValueError:
-            abort(400)
+            evidence_document = Document.query.filter_by(
+                id=document_id,
+                product_id=claim.product_id,
+            ).first()
 
-        evidence_document = Document.query.filter_by(
-            id=document_id,
-            product_id=claim.product_id,
-        ).first()
+            if not evidence_document:
+                abort(400)
 
-        if not evidence_document:
-            abort(400)
+            attachments.append((
+                evidence_document.stored_name,
+                evidence_document.original_name,
+                Path(evidence_document.original_name).suffix,
+            ))
 
-        evidence_path = upload_root / evidence_document.stored_name
+        # Stage each file only after checking that it exists.
+        staged_attachments = []
 
-        attachments.append((
-            str(evidence_path),
-            evidence_document.original_name,
-        ))
+        for storage_key, display_name, suffix in attachments:
+            try:
+                file_path = attachment_stack.enter_context(
+                    storage.temporary_file(storage_key, suffix=suffix)
+                )
 
-    # Validate every attachment before attempting submission.
-    for file_path, display_name in attachments:
-        try:
-            with open(file_path, "rb") as attachment_file:
-                attachment_file.read(1)
-        except OSError:
-            flash(
-                f"The selected evidence file '{display_name}' is missing "
-                "or cannot be read. Please upload it again before submitting.",
-                "error",
-            )
-            return redirect(url_for("main.claims"))
+                with open(file_path, "rb") as attachment_file:
+                    attachment_file.read(1)
 
-    product = claim.product
+            except (OSError, FileNotFoundError):
+                flash(
+                    f"The selected evidence file '{display_name}' is missing "
+                    "or cannot be read. Please upload it again before submitting.",
+                    "error",
+                )
+                return redirect(url_for("main.claims"))
 
-    body = "\n".join([
-        f"Dear {manufacturer_name} team,",
-        "",
-        "I would like to request warranty support for the product described below.",
-        "",
-        f"Product: {product.name}",
-        f"Brand: {product.brand or 'Not provided'}",
-        f"Model number: {product.model_number or 'Not provided'}",
-        f"Serial number: {product.serial_number or 'Not provided'}",
-        f"Retailer: {product.retailer or 'Not provided'}",
-        f"Purchase date: {product.purchase_date.isoformat() if product.purchase_date else 'Not provided'}",
-        f"Warranty expiry: {product.warranty_expiry.isoformat() if product.warranty_expiry else 'Not provided'}",
-        "",
-        f"Issue: {claim.issue_title}",
-        "Description:",
-        claim.description,
-        "",
-        "Please let me know the next steps and provide a service/claim reference if applicable.",
-        "",
-        current_user.name,
-        current_user.email,
-        "",
-        "Sent using WarrantyVault. This message was prepared by the product owner.",
-    ])
+            staged_attachments.append((
+                str(file_path),
+                display_name,
+            ))
 
-    # Handle simulation or actual SMTP submission.
-    if submission_mode == "simulation":
-        message_id = None
-        submission_channel = "Simulation"
-        audit_action = "claim_email_simulated"
+        attachments = staged_attachments
 
-    else:
-        try:
-            message_id = send_email(
-                current_app.config,
-                recipient=manufacturer_email,
-                subject=f"Warranty support request – {product.name}: {claim.issue_title}",
-                body=body,
-                reply_to=current_user.email,
-                attachments=attachments,
-            )
 
-        except Exception as exc:
-            claim.manufacturer_name = manufacturer_name
-            claim.manufacturer_email = manufacturer_email
-            claim.submission_error = str(exc)[:2000]
+        for file_path, display_name in attachments:
+            try:
+                with open(file_path, "rb") as attachment_file:
+                    attachment_file.read(1)
+            except OSError:
+                flash(
+                    f"The selected evidence file '{display_name}' is missing "
+                    "or cannot be read. Please upload it again before submitting.",
+                    "error",
+                )
+                return redirect(url_for("main.claims"))
 
-            _audit("claim", claim.id, "claim_email_failed", {
+        product = claim.product
+        body = "\n".join([
+            f"Dear {manufacturer_name} team,",
+            "",
+            "I would like to request warranty support for the product described below.",
+            "",
+            f"Product: {product.name}",
+            f"Brand: {product.brand or 'Not provided'}",
+            f"Model number: {product.model_number or 'Not provided'}",
+            f"Serial number: {product.serial_number or 'Not provided'}",
+            f"Retailer: {product.retailer or 'Not provided'}",
+            f"Purchase date: {product.purchase_date.isoformat() if product.purchase_date else 'Not provided'}",
+            f"Warranty expiry: {product.warranty_expiry.isoformat() if product.warranty_expiry else 'Not provided'}",
+            "",
+            f"Issue: {claim.issue_title}",
+            "Description:",
+            claim.description,
+            "",
+            "Please let me know the next steps and provide a service/claim reference if applicable.",
+            "",
+            current_user.name,
+            current_user.email,
+            "",
+            "Sent using WarrantyVault. This message was prepared by the product owner.",
+        ])
+
+        if submission_mode == "simulation":
+            message_id = None
+            submission_channel = "Simulation"
+            audit_action = "claim_email_simulated"
+        else:
+            try:
+                message_id = send_email(
+                    current_app.config,
+                    recipient=manufacturer_email,
+                    subject=f"Warranty support request – {product.name}: {claim.issue_title}",
+                    body=body,
+                    reply_to=current_user.email,
+                    attachments=attachments,
+                )
+            except Exception as exc:
+                claim.manufacturer_name = manufacturer_name
+                claim.manufacturer_email = manufacturer_email
+                claim.submission_error = str(exc)[:2000]
+                _audit("claim", claim.id, "claim_email_failed", {
+                    "recipient": manufacturer_email,
+                    "error": str(exc)[:500],
+                })
+                db.session.commit()
+                flash(
+                    "The claim email could not be sent due to an email service error. "
+                    "Please try again later or contact the administrator.",
+                    "error",
+                )
+                return redirect(url_for("main.claims"))
+
+            submission_channel = "Email"
+            audit_action = "claim_email_sent"
+
+        previous = claim.status
+        claim.manufacturer_name = manufacturer_name
+        claim.manufacturer_email = manufacturer_email
+        claim.submission_channel = submission_channel
+        claim.submission_message_id = message_id
+        claim.submission_error = None
+
+        if submission_mode == "simulation":
+            claim.status = "Draft"
+            claim.submitted_at = None
+        else:
+            claim.status = "Submitted"
+            claim.submitted_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            _audit("claim", claim.id, audit_action, {
+                "from": previous,
+                "to": claim.status,
                 "recipient": manufacturer_email,
-                "error": str(exc)[:500],
+                "message_id": message_id,
+                "attachments": [name for _path, name in attachments],
             })
 
-            db.session.commit()
+        db.session.commit()
 
+        if submission_mode == "simulation":
             flash(
-    "The claim email could not be sent due to an email service error. "
-    "Please try again later or contact the administrator.",
-    "error",
-)
-            return redirect(url_for("main.claims"))
+                "Simulation completed successfully. No email was sent.",
+                "success",
+            )
+        else:
+            flash(
+                "Claim email accepted by your SMTP server. "
+                "This does not confirm manufacturer receipt or acknowledgment.",
+                "success",
+            )
 
-        submission_channel = "Email"
-        audit_action = "claim_email_sent"
-
-    # Update the claim only after successful SMTP acceptance
-    # or an explicitly permitted simulation.
-    previous = claim.status
-
-    claim.manufacturer_name = manufacturer_name
-    claim.manufacturer_email = manufacturer_email
-    claim.submission_channel = submission_channel
-    claim.submission_message_id = message_id
-    claim.submission_error = None
-
-    if submission_mode == "simulation":
-        claim.status = "Draft"
-        claim.submitted_at = None
-    else:
-        claim.status = "Submitted"
-        claim.submitted_at = datetime.now(timezone.utc).replace(tzinfo=None)
-
-        _audit("claim", claim.id, audit_action, {
-    "from": previous,
-    "to": claim.status,
-    "recipient": manufacturer_email,
-    "message_id": message_id,
-    "attachments": [name for _path, name in attachments],
-})
-
-    db.session.commit()
-
-    if submission_mode == "simulation":
-        flash(
-            "Simulation completed successfully. No email was sent.",
-            "success",
-        )
-    else:
-        flash(
-            "Claim email accepted by your SMTP server. "
-            "This does not confirm manufacturer receipt or acknowledgment.",
-            "success",
-        )
-
-    return redirect(url_for("main.claims"))
-
-
+        return redirect(url_for("main.claims"))
 
 
 @main_bp.post("/claims/<int:claim_id>/status")

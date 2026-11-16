@@ -1,9 +1,14 @@
 
 """Application configuration."""
+
 import os
 from pathlib import Path
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
+
+load_dotenv(BASE_DIR / ".env")
+
 
 
 class Config:
@@ -31,11 +36,29 @@ class Config:
     REMEMBER_COOKIE_HTTPONLY = True
     SESSION_COOKIE_SAMESITE = "Lax"
     # Database
-    SQLALCHEMY_DATABASE_URI = os.getenv(
-        "DATABASE_URL",
-        f"sqlite:///{BASE_DIR / 'instance' / 'warrantyvault.db'}"
+    DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace(
+            "postgres://",
+            "postgresql+psycopg://",
+            1,
+        )
+    elif DATABASE_URL.startswith("postgresql://"):
+        DATABASE_URL = DATABASE_URL.replace(
+            "postgresql://",
+            "postgresql+psycopg://",
+            1,
+        )
+
+    SQLALCHEMY_DATABASE_URI = (
+        DATABASE_URL
+        if DATABASE_URL
+        else f"sqlite:///{BASE_DIR / 'instance' / 'warrantyvault.db'}"
     )
+
     SQLALCHEMY_TRACK_MODIFICATIONS = False
+
 
     # Uploads
     MAX_CONTENT_LENGTH = 16 * 1024 * 1024
@@ -43,6 +66,24 @@ class Config:
         "UPLOAD_FOLDER",
         str(BASE_DIR / "instance" / "uploads")
     )
+
+    # File storage backend: local or supabase
+    STORAGE_BACKEND = os.getenv(
+        "STORAGE_BACKEND", "local"
+    ).strip().lower()
+
+    # Supabase Storage configuration
+    SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+    SUPABASE_SERVICE_ROLE_KEY = os.getenv(
+        "SUPABASE_SERVICE_ROLE_KEY", ""
+    ).strip()
+    SUPABASE_STORAGE_BUCKET = os.getenv(
+        "SUPABASE_STORAGE_BUCKET", "warrantyvault-uploads"
+    ).strip()
+    SUPABASE_STORAGE_TIMEOUT = int(
+        os.getenv("SUPABASE_STORAGE_TIMEOUT", "30")
+    )
+
     ALLOWED_EXTENSIONS = {
         "pdf", "png", "jpg", "jpeg",
         "tif", "tiff", "txt", "docx"

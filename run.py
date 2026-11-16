@@ -11,8 +11,12 @@ app = create_app()
 
 @app.cli.command("init-db")
 def init_db_command():
-    """Create all application tables."""
+    """Create all application tables and apply schema compatibility updates."""
     db.create_all()
+
+    from app.schema import ensure_schema_compatibility
+    ensure_schema_compatibility()
+
     print("WarrantyVault database tables are ready.")
 
 
