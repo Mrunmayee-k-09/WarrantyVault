@@ -14,6 +14,7 @@ def app(tmp_path):
     "SQLALCHEMY_DATABASE_URI": "sqlite://",
     "SQLALCHEMY_TRACK_MODIFICATIONS": False,
     "UPLOAD_FOLDER": str(upload_dir),
+    "STORAGE_BACKEND": "local",
     "CLAIM_SUBMISSION_MODE": "smtp",
 })
     assert test_app.config["CLAIM_SUBMISSION_MODE"] == "smtp"

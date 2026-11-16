@@ -1,37 +1,58 @@
+
 """Additive schema upgrades and lightweight migration tracking."""
+
 from sqlalchemy import inspect, text
 from .extensions import db
+
+
 SCHEMA_VERSIONS = (
     "001_additive_compatibility_columns",
     "002_unique_notification_event_key",
 )
-ADDITIVE_COLUMNS = {
-    "user": {
-        "reminder_email_enabled": "BOOLEAN NOT NULL DEFAULT 0",
-        "reminder_email": "VARCHAR(180)",
-    },
-    "claim": {
-        "manufacturer_name": "VARCHAR(180)",
-        "manufacturer_email": "VARCHAR(180)",
-        "submission_channel": "VARCHAR(30)",
-        "submitted_at": "DATETIME",
-        "submission_message_id": "VARCHAR(255)",
-        "submission_error": "TEXT",
-    },
-    "notification": {
-        "event_key": "VARCHAR(255)",
-        "email_sent_at": "DATETIME",
-        "email_error": "TEXT",
-    },
-}
+
+
 def ensure_schema_compatibility():
     """Add missing compatibility columns and record the schema baseline."""
+
+    dialect = db.engine.dialect.name
+
+    # Use SQL types and defaults supported by the active database.
+    if dialect == "postgresql":
+        boolean_type = "BOOLEAN NOT NULL DEFAULT FALSE"
+        datetime_type = "TIMESTAMP"
+        migration_datetime_type = "TIMESTAMP NOT NULL"
+    else:
+        boolean_type = "BOOLEAN NOT NULL DEFAULT 0"
+        datetime_type = "DATETIME"
+        migration_datetime_type = "DATETIME NOT NULL"
+
+    additive_columns = {
+        "user": {
+            "reminder_email_enabled": boolean_type,
+            "reminder_email": "VARCHAR(180)",
+        },
+        "claim": {
+            "manufacturer_name": "VARCHAR(180)",
+            "manufacturer_email": "VARCHAR(180)",
+            "submission_channel": "VARCHAR(30)",
+            "submitted_at": datetime_type,
+            "submission_message_id": "VARCHAR(255)",
+            "submission_error": "TEXT",
+        },
+        "notification": {
+            "event_key": "VARCHAR(255)",
+            "email_sent_at": datetime_type,
+            "email_error": "TEXT",
+        },
+    }
 
     inspector = inspect(db.engine)
     existing_tables = set(inspector.get_table_names())
 
     with db.engine.begin() as connection:
-        for table_name, columns in ADDITIVE_COLUMNS.items():
+
+        # 1. Add missing compatibility columns.
+        for table_name, columns in additive_columns.items():
             if table_name not in existing_tables:
                 continue
 
@@ -48,9 +69,12 @@ def ensure_schema_compatibility():
                             f"ADD COLUMN {column_name} {sql_type}"
                         )
                     )
-        # Prevent duplicate reminder events for the same user.
+
+        # 2. Prevent duplicate reminder events for the same user.
         notification_indexes = inspect(connection).get_indexes("notification")
-        notification_constraints = inspect(connection).get_unique_constraints("notification")
+        notification_constraints = inspect(
+            connection
+        ).get_unique_constraints("notification")
 
         has_event_uniqueness = (
             any(
@@ -65,19 +89,40 @@ def ensure_schema_compatibility():
         )
 
         if not has_event_uniqueness:
+            duplicates = connection.execute(
+                text("""
+                    SELECT user_id, event_key, COUNT(*) AS occurrences
+                    FROM notification
+                    WHERE event_key IS NOT NULL
+                    GROUP BY user_id, event_key
+                    HAVING COUNT(*) > 1
+                    LIMIT 5
+                """)
+            ).fetchall()
+
+            if duplicates:
+                raise RuntimeError(
+                    "Cannot create the notification event uniqueness index. "
+                    "Duplicate (user_id, event_key) values exist: "
+                    f"{duplicates}"
+                )
+
             connection.execute(text("""
                 CREATE UNIQUE INDEX uq_notification_user_event
                 ON notification (user_id, event_key)
             """))
-# Create the migration history table if it doesn't exist.
-        connection.execute(text("""
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version VARCHAR(50) PRIMARY KEY,
-                applied_at DATETIME NOT NULL
-            )
-        """))
 
-    # Record each applied schema version exactly once.
+        # 3. Create the migration history table if necessary.
+        connection.execute(
+            text(f"""
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version VARCHAR(50) PRIMARY KEY,
+                    applied_at {migration_datetime_type}
+                )
+            """)
+        )
+
+        # 4. Record each schema version exactly once.
         for version in SCHEMA_VERSIONS:
             already_recorded = connection.execute(
                 text("""

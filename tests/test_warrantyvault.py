@@ -1569,6 +1569,11 @@ def test_schema_compatibility_upgrades_existing_user_table(tmp_path):
     })
 
     with app.app_context():
+        # Run the same initialization sequence as the application's init-db command.
+        db.create_all()
+
+        from app.schema import ensure_schema_compatibility
+        ensure_schema_compatibility()
         # Verify that the old record survived the schema upgrade.
         user = db.session.execute(
             text("SELECT * FROM user WHERE id = 1")
